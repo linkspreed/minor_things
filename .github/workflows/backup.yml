@@ -39,12 +39,16 @@ jobs:
         id: run_backup
         continue-on-error: true   # WICHTIG: Ein Fehler hier darf die E-Mail unten nicht verhindern
         env:
-          GITHUB_SOURCE_TOKEN: ${{ secrets.GITHUB_SOURCE_TOKEN }}
-          GITHUB_SOURCE_OWNER: ${{ vars.GITHUB_SOURCE_OWNER }}
-          GITHUB_SOURCE_OWNER_TYPE: ${{ vars.GITHUB_SOURCE_OWNER_TYPE }}
-          GITHUB_BACKUP_TOKEN: ${{ secrets.GITHUB_BACKUP_TOKEN }}
-          GITHUB_BACKUP_OWNER: ${{ vars.GITHUB_BACKUP_OWNER }}
-          GITHUB_BACKUP_OWNER_TYPE: ${{ vars.GITHUB_BACKUP_OWNER_TYPE }}
+          # WICHTIG: GitHub verbietet eigene Secret-/Variable-Namen, die mit
+          # "GITHUB_" beginnen (reserviert fuer GitHubs eigene Werte).
+          # Deshalb heissen die Quelle/Ziel-1-Werte hier "SRC_GH_..." bzw.
+          # "BACKUP_GH_...".
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          BACKUP_GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
+          BACKUP_GH_OWNER: ${{ vars.BACKUP_GH_OWNER }}
+          BACKUP_GH_OWNER_TYPE: ${{ vars.BACKUP_GH_OWNER_TYPE }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_NAMESPACE: ${{ vars.GITLAB_NAMESPACE }}
           GITLAB_URL: ${{ vars.GITLAB_URL }}
@@ -67,8 +71,6 @@ jobs:
       # so kann selbst ein kompromittierter Maintainer-Account dieser
       # fremden Action nicht nachträglich bösartigen Code einschleusen,
       # der versucht, MAIL_CONNECTION_URL/NOTIFY_EMAIL abzugreifen.
-      # Dasselbe Vorgehen wird z.B. vom LaTeX3-Projekt aus genau diesem
-      # Sicherheitsgrund verwendet.
       # -----------------------------------------------------------------
       - name: Ergebnis per E-Mail senden
         if: always()
