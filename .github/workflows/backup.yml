@@ -9,10 +9,7 @@ on:
 jobs:
   backup:
     runs-on: ubuntu-latest
-    # ^ bewusst der Standard-Linux-Runner: auf oeffentlichen Repos kostenlos
-    #   & unbegrenzt, staerker als der Apple-Silicon-Mac-Runner (4 Kerne/16GB
-    #   statt 3 Kerne/7GB) und die native Git/Bash-Umgebung.
-    timeout-minutes: 350   # Puffer unter dem harten 6-Stunden-Limit pro Job
+    timeout-minutes: 350
 
     steps:
       - name: Repo auschecken
@@ -26,23 +23,10 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pip install -r requirements.txt
 
-      # -----------------------------------------------------------------
-      # Absichtlich KEIN Caching der lokalen Mirrors zwischen Läufen:
-      # Standard-Runner haben nur 14 GB Festplatte - bei 150+ teils
-      # großen Repos reicht das nicht, wenn alle gleichzeitig vorgehalten
-      # werden müssten. Das Skript klont/spiegelt/löscht daher jedes
-      # Repo einzeln nacheinander (siehe backup_repos.py). Das kostet
-      # etwas mehr Zeit, ist aber egal, da Minuten hier unbegrenzt sind.
-      # -----------------------------------------------------------------
-
       - name: Backup ausführen
         id: run_backup
         continue-on-error: true   # WICHTIG: Ein Fehler hier darf die E-Mail unten nicht verhindern
         env:
-          # WICHTIG: GitHub verbietet eigene Secret-/Variable-Namen, die mit
-          # "GITHUB_" beginnen (reserviert fuer GitHubs eigene Werte).
-          # Deshalb heissen die Quelle/Ziel-1-Werte hier "SRC_GH_..." bzw.
-          # "BACKUP_GH_...".
           SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
           SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
@@ -61,30 +45,23 @@ jobs:
         run: python backup_repos.py
 
       # -----------------------------------------------------------------
-      # E-Mail wird IMMER verschickt (if: always()) - egal ob der Lauf
-      # oben erfolgreich war oder fehlgeschlagen ist. Die komplette
-      # Ziel-Adresse UND alle Zugangsdaten kommen ausschließlich aus
-      # Secrets - stehen NIRGENDWO im Klartext in dieser Datei, obwohl
-      # das Repo öffentlich ist.
-      #
-      # WICHTIG: Auf einen festen COMMIT-HASH gepinnt (nicht "@v3"!) -
-      # so kann selbst ein kompromittierter Maintainer-Account dieser
-      # fremden Action nicht nachträglich bösartigen Code einschleusen,
-      # der versucht, MAIL_CONNECTION_URL/NOTIFY_EMAIL abzugreifen.
+      # FIX: "from" braucht eine ECHTE E-Mail-Adresse (nicht nur einen
+      # Anzeigenamen wie vorher "Repo-Backup-Bot") - viele SMTP-Server
+      # (u.a. Gmail) bestehen darauf, dass die Absenderadresse mit dem
+      # tatsaechlichen Login-Konto uebereinstimmt. Neuer Secret
+      # MAIL_FROM_ADDRESS = dieselbe Adresse wie in MAIL_CONNECTION_URL.
       # -----------------------------------------------------------------
       - name: Ergebnis per E-Mail senden
         if: always()
-        uses: dawidd6/action-send-mail@42942bc2f8fba4e611b459a018967a6a7c78c68c # v17 (Commit-Hash gepinnt, siehe Kommentar oben)
+        uses: dawidd6/action-send-mail@42942bc2f8fba4e611b459a018967a6a7c78c68c # v17 (Commit-Hash gepinnt)
         with:
           connection_url: ${{ secrets.MAIL_CONNECTION_URL }}
           subject: "Repo-Backup: ${{ steps.run_backup.outcome == 'success' && 'OK' || 'FEHLGESCHLAGEN' }}"
           to: ${{ secrets.NOTIFY_EMAIL }}
-          from: "Repo-Backup-Bot"
+          from: ${{ secrets.MAIL_FROM_ADDRESS }}
           body: file://email_summary.txt
           convert_markdown: false
 
-      # Fällt der Job wegen des Backup-Fehlers auf "rot", damit du es auch
-      # im Actions-Tab siehst (ohne Details preiszugeben) - NACH der Mail!
       - name: Lauf ggf. als fehlgeschlagen markieren
         if: steps.run_backup.outcome != 'success'
         run: exit 1
