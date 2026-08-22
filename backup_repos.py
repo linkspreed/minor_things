@@ -39,6 +39,16 @@
   verwendet wird. Der ANZEIGE-Name ("name"-Feld) bleibt unveraendert,
   nur der URL-Pfad ("path"-Feld) wird bereinigt.
 
+  FIX C) (NEU) Google-Drive-Upload-Reihenfolge:
+  Bisher wurde die alte ZIP-Datei ZUERST geloescht und DANACH die neue
+  hochgeladen. Schlaegt der Upload fehl (z.B. Netzwerkfehler, auch nach
+  allen Retries), gab es zwischenzeitlich GAR KEIN Backup mehr auf
+  Google Drive fuer dieses Repo.
+  LOESUNG: Reihenfolge umgedreht - ERST wird die neue ZIP-Datei
+  hochgeladen, ERST DANACH (bei Erfolg) wird die alte Datei geloescht.
+  Dadurch gibt es zu keinem Zeitpunkt eine Luecke; es entsteht nur kurz
+  doppelter Speicherplatzbedarf (ein ZIP mehr, bis das alte geloescht ist).
+
   ---------------------------------------------------------------
   BESTEHENDE FUNKTIONSWEISE:
   ---------------------------------------------------------------
@@ -449,7 +459,8 @@ def create_gitlab2_dated_project(dated_name: str) -> str:
 
 
 # ====================================================================
-#  4) GOOGLE DRIVE Backup (ueberschreibt - alte Zip loeschen, neue hochladen)
+#  4) GOOGLE DRIVE Backup (ueberschreibt - alte Zip wird ERST NACH
+#     erfolgreichem Upload der neuen Zip geloescht, siehe FIX C oben)
 # ====================================================================
 
 _drive_service = None
@@ -511,6 +522,13 @@ def ensure_drive_backup_folder(service) -> str:
 
 
 def backup_to_drive(bare_path: Path, repo_name: str):
+    """
+    FIX C: Reihenfolge geaendert - ERST wird die neue ZIP-Datei
+    hochgeladen, ERST DANACH (nur bei Erfolg) werden alte, gleichnamige
+    Dateien geloescht. Vorher: erst loeschen, dann hochladen - dadurch
+    gab es bei einem fehlgeschlagenen Upload zwischenzeitlich GAR KEIN
+    Backup auf Google Drive fuer dieses Repo.
+    """
     from googleapiclient.http import MediaFileUpload
 
     service = get_drive_service()
@@ -525,6 +543,7 @@ def backup_to_drive(bare_path: Path, repo_name: str):
                 if file.is_file():
                     zf.write(file, arcname=str(file.relative_to(bare_path.parent)))
 
+        # --- Schritt 1: alte Datei(en) mit gleichem Namen VORAB nur SUCHEN (noch nicht loeschen) ---
         query = f"name = '{zip_name}' and '{target_folder_id}' in parents and trashed = false"
         existing = with_retry(
             lambda: service.files().list(
@@ -533,12 +552,8 @@ def backup_to_drive(bare_path: Path, repo_name: str):
             ).execute().get("files", []),
             f"alte Drive-Datei suchen ({repo_name})",
         )
-        for f in existing:
-            with_retry(
-                lambda f=f: service.files().delete(fileId=f["id"], supportsAllDrives=True).execute(),
-                f"alte Drive-Datei löschen ({repo_name})",
-            )
 
+        # --- Schritt 2: NEUE Datei hochladen (die alte bleibt bis hierhin unangetastet) ---
         summary_log(f"  -> lade zu Google Drive hoch")
         media = MediaFileUpload(str(zip_path), mimetype="application/zip", resumable=True)
         with_retry(
@@ -550,6 +565,13 @@ def backup_to_drive(bare_path: Path, repo_name: str):
             ).execute(),
             f"Drive-Upload ({repo_name})",
         )
+
+        # --- Schritt 3: erst JETZT (nach erfolgreichem Upload) die alte(n) Datei(en) loeschen ---
+        for f in existing:
+            with_retry(
+                lambda f=f: service.files().delete(fileId=f["id"], supportsAllDrives=True).execute(),
+                f"alte Drive-Datei löschen ({repo_name})",
+            )
 
 
 # ====================================================================
