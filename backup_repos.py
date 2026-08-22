@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ====================================================================
-  GITHUB REPO SUPER-BACKUP  (Public-Repo-Safe Version + E-Mail)
+  GITHUB REPO SUPER-BACKUP  (Public-Repo-Safe Version + Google Chat)
 --------------------------------------------------------------------
   Spiegelt ALLE Repos eines GitHub-Accounts (voller Verlauf, alle
   Branches, alle Tags) automatisch nach:
@@ -11,24 +11,27 @@
     3) Google Drive                    (komplettes .git-Bundle als ZIP,
                                          alte Version wird ersetzt)
 
-  WICHTIGE FIXES IN DIESER VERSION (nach dem ersten Testlauf):
+  BENACHRICHTIGUNG: Statt E-Mail wird ein Google-Chat-Webhook genutzt
+  (siehe backup.yml) - einfacher als SMTP, kein extra E-Mail-Konto
+  noetig. Dieses Skript selbst schreibt die Zusammenfassung nur in
+  eine lokale Datei (email_summary.txt); der Versand an Google Chat
+  passiert im Workflow selbst per curl.
+
+  WICHTIGE FIXES (nach dem ersten Testlauf):
 
   1) JEDES ZIEL BEKOMMT EINEN EIGENEN try/except-BLOCK pro Repo.
      Vorher waren GitHub-Backup, GitLab und Google Drive in EINEM
      gemeinsamen try-Block - schlug z.B. GitLab fehl, wurde Google
-     Drive fuer dasselbe Repo GAR NICHT ERST versucht (der Code sprang
-     sofort zum except). Das erklaerte, warum bei GitLab und Drive
-     fast gleich viele Repos fehlten. Jetzt wird JEDES Ziel unabhaengig
-     versucht, egal ob ein anderes Ziel zuvor fehlgeschlagen ist.
+     Drive fuer dasselbe Repo GAR NICHT ERST versucht. Jetzt wird
+     JEDES Ziel unabhaengig versucht, egal ob ein anderes Ziel zuvor
+     fehlgeschlagen ist.
 
   2) GITLAB-EXISTENZ-CHECK auf DIREKTE PFAD-ABFRAGE umgestellt statt
      Such-API. Die alte "search"-API durchsucht standardmaessig ALLE
      oeffentlichen Projekte auf ganz GitLab.com - bei generischen
-     Repo-Namen wurde das eigene (bereits angelegte) Projekt von
-     fremden oeffentlichen Treffern auf Seite 1 verdraengt, das Skript
-     hielt es faelschlich fuer "existiert nicht" und versuchte es
-     erneut anzulegen -> Fehler "Pfad bereits vergeben" -> Abbruch.
-     Die neue Methode (GET /projects/:id mit URL-kodiertem
+     Repo-Namen wurde das eigene Projekt von fremden Treffern
+     verdraengt und faelschlich fuer "existiert nicht" gehalten. Die
+     neue Methode (GET /projects/:id mit URL-kodiertem
      "namespace/name") ist ein exakter, eindeutiger Treffer.
 
   (Bitbucket wurde bewusst NICHT eingebaut: Bitbucket begrenzt den
@@ -49,7 +52,7 @@
   GitHub-Repo zu laufen (fuer unbegrenzte, kostenlose Actions-Minuten),
   OHNE dass irgendjemand aus den Actions-Logs ablesen kann, welche
   Repos du hast (Konsole zeigt nur "Repo 3/156", nie echte Namen; alle
-  Details landen ausschliesslich in der E-Mail-Zusammenfassung).
+  Details landen ausschliesslich in der Chat-Zusammenfassung).
 
   FESTPLATTEN-MANAGEMENT: Standard-Runner haben nur 14 GB SSD. Nach
   jedem einzelnen Repo wird der lokale Mirror-Ordner SOFORT wieder
@@ -102,8 +105,9 @@ GDRIVE_FOLDER_ID = env("GDRIVE_FOLDER_ID")          # ID der geteilten Ablage / 
 GDRIVE_SA_JSON = env("GDRIVE_SA_JSON")              # Inhalt des Service-Account-JSON-Keys (als Text)
 GDRIVE_BACKUP_FOLDER_NAME = env("GDRIVE_BACKUP_FOLDER_NAME", default="Repo_Backups")
 
-# --- E-Mail-Benachrichtigung (wird bei JEDEM Lauf verschickt, Erfolg wie Fehler) ---
-EMAIL_SUMMARY_FILE = Path(env("EMAIL_SUMMARY_FILE", default="email_summary.txt"))
+# --- Zusammenfassung für Benachrichtigung (wird vom Workflow z.B. an
+#     Google Chat gesendet, siehe backup.yml) ------------------------
+SUMMARY_FILE = Path(env("EMAIL_SUMMARY_FILE", default="email_summary.txt"))
 
 # --- Allgemein
 WORKDIR = Path(env("BACKUP_WORKDIR", default="mirrors"))
@@ -125,17 +129,17 @@ def redact(text: str) -> str:
 
 
 # ====================================================================
-#  LOGGING: Konsole = anonym/leer. E-Mail-Text = vollstaendig.
+#  LOGGING: Konsole = anonym/leer. Summary-Datei = vollstaendig.
 # ====================================================================
 
-EMAIL_LINES = []
+SUMMARY_LINES = []
 _repo_total = 0
 _repo_index = 0
 
 
-def email_log(msg: str):
+def summary_log(msg: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    EMAIL_LINES.append(f"[{ts}] {redact(str(msg))}")
+    SUMMARY_LINES.append(f"[{ts}] {redact(str(msg))}")
 
 
 def console_heartbeat(msg: str = None):
@@ -198,18 +202,18 @@ def mirror_clone_local(repo_name: str, source_clone_url_with_token: str) -> Path
     bare_path = WORKDIR / f"{repo_name}.git"
     if bare_path.exists():
         shutil.rmtree(bare_path)
-    email_log(f"  -> klone {repo_name}")
+    summary_log(f"  -> klone {repo_name}")
     run(["git", "clone", "--mirror", source_clone_url_with_token, str(bare_path)])
     return bare_path
 
 
 def push_mirror(bare_path: Path, target_url_with_token: str, label: str):
-    email_log(f"  -> spiegle nach {label}")
+    summary_log(f"  -> spiegle nach {label}")
     try:
         run(["git", "--git-dir", str(bare_path), "push", "--mirror", target_url_with_token])
     except RuntimeError as e:
         if "up-to-date" in str(e).lower():
-            email_log(f"     ({label}: bereits aktuell)")
+            summary_log(f"     ({label}: bereits aktuell)")
         else:
             raise
 
@@ -235,7 +239,7 @@ def ensure_github_target_repo(name: str):
     r = requests.post(create_url, headers=headers, json={"name": name, "private": True}, timeout=30)
     if r.status_code not in (201, 422):
         raise RuntimeError(redact(f"GitHub-Backup-Repo konnte nicht angelegt werden: {r.text}"))
-    email_log(f"  -> GitHub-Backup-Repo '{name}' neu angelegt")
+    summary_log(f"  -> GitHub-Backup-Repo '{name}' neu angelegt")
 
 
 def ensure_gitlab_target_repo(name: str):
@@ -256,23 +260,18 @@ def ensure_gitlab_target_repo(name: str):
     if r.status_code == 200:
         return  # existiert bereits - fertig
 
-    # Existiert noch nicht -> anlegen. Namespace-ID ermitteln (direkter
-    # Lookup statt Suche - funktioniert mit Pfad ODER numerischer ID).
     payload = {"name": name, "path": name, "visibility": "private"}
     encoded_ns = urllib.parse.quote(GITLAB_NAMESPACE, safe="")
     ns_r = requests.get(f"{GITLAB_URL}/api/v4/namespaces/{encoded_ns}", headers=headers, timeout=30)
     if ns_r.status_code == 200:
         ns_data = ns_r.json()
-        # Nur bei Gruppen-Namespaces explizit setzen; bei einem
-        # persoenlichen Namespace legt GitLab automatisch im eigenen
-        # Account an, wenn namespace_id weggelassen wird.
         if ns_data.get("kind") == "group":
             payload["namespace_id"] = ns_data["id"]
 
     r = requests.post(f"{GITLAB_URL}/api/v4/projects", headers=headers, json=payload, timeout=30)
     if r.status_code != 201:
         raise RuntimeError(redact(f"GitLab-Projekt konnte nicht angelegt werden: {r.text}"))
-    email_log(f"  -> GitLab-Projekt '{name}' neu angelegt")
+    summary_log(f"  -> GitLab-Projekt '{name}' neu angelegt")
 
 
 # ====================================================================
@@ -314,7 +313,7 @@ def ensure_drive_backup_folder(service) -> str:
 
     if existing:
         _drive_backup_folder_id = existing[0]["id"]
-        email_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' gefunden (wird verwendet).")
+        summary_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' gefunden (wird verwendet).")
         return _drive_backup_folder_id
 
     folder = service.files().create(
@@ -327,7 +326,7 @@ def ensure_drive_backup_folder(service) -> str:
         supportsAllDrives=True,
     ).execute()
     _drive_backup_folder_id = folder["id"]
-    email_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' neu angelegt.")
+    summary_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' neu angelegt.")
     return _drive_backup_folder_id
 
 
@@ -340,7 +339,7 @@ def backup_to_drive(bare_path: Path, repo_name: str):
 
     with tempfile.TemporaryDirectory() as tmp:
         zip_path = Path(tmp) / zip_name
-        email_log(f"  -> packe für Google Drive")
+        summary_log(f"  -> packe für Google Drive")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for file in bare_path.rglob("*"):
                 if file.is_file():
@@ -354,7 +353,7 @@ def backup_to_drive(bare_path: Path, repo_name: str):
         for f in existing:
             service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
 
-        email_log(f"  -> lade zu Google Drive hoch")
+        summary_log(f"  -> lade zu Google Drive hoch")
         media = MediaFileUpload(str(zip_path), mimetype="application/zip", resumable=True)
         service.files().create(
             body={"name": zip_name, "parents": [target_folder_id]},
@@ -370,24 +369,20 @@ def backup_to_drive(bare_path: Path, repo_name: str):
 
 def process_repo(repo: dict) -> bool:
     """
-    Verarbeitet ein Repo. WICHTIG (FIX): Jedes Ziel (GitHub-Backup,
-    GitLab, Google Drive) hat einen EIGENEN try/except-Block. Schlaegt
-    z.B. GitLab fehl, wird Google Drive fuer dasselbe Repo TROTZDEM
-    versucht - anders als in der vorherigen Version, wo ein Fehler bei
-    einem Ziel alle nachfolgenden Ziele fuer dieses Repo blockierte.
+    Verarbeitet ein Repo. Jedes Ziel (GitHub-Backup, GitLab, Google
+    Drive) hat einen EIGENEN try/except-Block. Schlaegt z.B. GitLab
+    fehl, wird Google Drive fuer dasselbe Repo TROTZDEM versucht.
     """
     name = repo["name"]
-    email_log(f"--- {name} ---")
+    summary_log(f"--- {name} ---")
     bare_path = None
     overall_ok = True
 
-    # Klonen ist die Grundvoraussetzung fuer ALLE Ziele - schlaegt das
-    # fehl, koennen wir fuer dieses Repo gar nichts tun.
     try:
         source_url = repo["clone_url"].replace("https://", f"https://{SRC_GH_TOKEN}@")
         bare_path = mirror_clone_local(name, source_url)
     except Exception as e:  # noqa: BLE001
-        email_log(f"  !! FEHLER beim Klonen von {name}: {e}")
+        summary_log(f"  !! FEHLER beim Klonen von {name}: {e}")
         return False
 
     if BACKUP_GH_TOKEN and BACKUP_GH_OWNER:
@@ -396,7 +391,7 @@ def process_repo(repo: dict) -> bool:
             target = f"https://{BACKUP_GH_TOKEN}@github.com/{BACKUP_GH_OWNER}/{name}.git"
             push_mirror(bare_path, target, "GitHub-Backup-Account")
         except Exception as e:  # noqa: BLE001
-            email_log(f"  !! FEHLER (GitHub-Backup) bei {name}: {e}")
+            summary_log(f"  !! FEHLER (GitHub-Backup) bei {name}: {e}")
             overall_ok = False
 
     if GITLAB_TOKEN and GITLAB_NAMESPACE:
@@ -406,20 +401,20 @@ def process_repo(repo: dict) -> bool:
             target = f"https://oauth2:{GITLAB_TOKEN}@{gitlab_host}/{GITLAB_NAMESPACE}/{name}.git"
             push_mirror(bare_path, target, "GitLab")
         except Exception as e:  # noqa: BLE001
-            email_log(f"  !! FEHLER (GitLab) bei {name}: {e}")
+            summary_log(f"  !! FEHLER (GitLab) bei {name}: {e}")
             overall_ok = False
 
     if GDRIVE_SA_JSON and GDRIVE_FOLDER_ID:
         try:
             backup_to_drive(bare_path, name)
         except Exception as e:  # noqa: BLE001
-            email_log(f"  !! FEHLER (Google Drive) bei {name}: {e}")
+            summary_log(f"  !! FEHLER (Google Drive) bei {name}: {e}")
             overall_ok = False
 
     cleanup_local_mirror(bare_path)
 
     if overall_ok:
-        email_log(f"  OK ({name})")
+        summary_log(f"  OK ({name})")
     return overall_ok
 
 
@@ -428,14 +423,14 @@ def main():
 
     start_time = datetime.now(timezone.utc)
     console_heartbeat("Backup gestartet.")
-    email_log("===== Repo-Backup gestartet =====")
+    summary_log("===== Repo-Backup gestartet =====")
 
     ok, failed, failed_names = 0, 0, []
 
     try:
         repos = list_source_repos()
         _repo_total = len(repos)
-        email_log(f"{_repo_total} Quell-Repos gefunden.")
+        summary_log(f"{_repo_total} Quell-Repos gefunden.")
 
         for i, repo in enumerate(repos, start=1):
             _repo_index = i
@@ -448,12 +443,12 @@ def main():
                 failed_names.append(repo["name"])
 
     except Exception as e:  # noqa: BLE001
-        email_log(f"!! SCHWERWIEGENDER FEHLER, Lauf abgebrochen: {e}")
-        email_log(redact(traceback.format_exc()))
+        summary_log(f"!! SCHWERWIEGENDER FEHLER, Lauf abgebrochen: {e}")
+        summary_log(redact(traceback.format_exc()))
 
     duration = (datetime.now(timezone.utc) - start_time).total_seconds()
     summary_line = f"===== Fertig: {ok} ok, {failed} Fehler von {ok + failed} Repos. Dauer: {int(duration)}s ====="
-    email_log(summary_line)
+    summary_log(summary_line)
     console_heartbeat("Backup beendet.")
 
     subject_status = "OK" if failed == 0 else f"{failed} FEHLER"
@@ -466,7 +461,7 @@ def main():
         header += "Repos mit mindestens einem Fehler: " + ", ".join(failed_names) + "\n"
     header += "\n----- Vollständiges Protokoll -----\n"
 
-    EMAIL_SUMMARY_FILE.write_text(header + "\n".join(EMAIL_LINES) + "\n", encoding="utf-8")
+    SUMMARY_FILE.write_text(header + "\n".join(SUMMARY_LINES) + "\n", encoding="utf-8")
     sys.exit(1 if failed > 0 else 0)
 
 
