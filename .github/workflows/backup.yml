@@ -2,9 +2,19 @@ name: Repo Super-Backup
 
 on:
   schedule:
-    - cron: '0 5 * * *'    # ca. 07:00 Uhr Sommerzeit / 06:00 Uhr Winterzeit in München
-    - cron: '0 17 * * *'   # ca. 19:00 Uhr Sommerzeit / 18:00 Uhr Winterzeit in München
+    # Alle 6 Stunden = 4x täglich: 00:00, 06:00, 12:00, 18:00 UTC
+    # (≈ 02:00, 08:00, 14:00, 20:00 Uhr Sommerzeit in München;
+    #  ≈ 01:00, 07:00, 13:00, 19:00 Uhr Winterzeit in München)
+    - cron: '0 */6 * * *'
   workflow_dispatch: {}     # erlaubt manuelles Starten über den "Run workflow"-Button
+
+# Verhindert, dass zwei Läufe gleichzeitig laufen (z.B. ein geplanter
+# 6-Stunden-Trigger überschneidet sich mit einem manuellen Start). Ein
+# neuer Lauf wartet, bis der vorherige fertig ist, statt parallel zu
+# laufen.
+concurrency:
+  group: repo-super-backup
+  cancel-in-progress: false
 
 jobs:
   backup:
@@ -27,39 +37,36 @@ jobs:
         id: run_backup
         continue-on-error: true   # WICHTIG: Ein Fehler hier darf die Benachrichtigung unten nicht verhindern
         env:
+          # --- Quelle: dein Haupt-GitHub-Account ---
           SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
           SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          # --- Ziel 1: zweiter GitHub-Account ---
           BACKUP_GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
           BACKUP_GH_OWNER: ${{ vars.BACKUP_GH_OWNER }}
           BACKUP_GH_OWNER_TYPE: ${{ vars.BACKUP_GH_OWNER_TYPE }}
+          # --- Ziel 2: GitLab-Account #1 (überschreibt/mirrort) ---
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_NAMESPACE: ${{ vars.GITLAB_NAMESPACE }}
           GITLAB_URL: ${{ vars.GITLAB_URL }}
+          # --- Ziel 3: GitLab-Account #2 (legt JEDEN Lauf neue, datierte Projekte an) ---
+          GITLAB2_TOKEN: ${{ secrets.GITLAB2_TOKEN }}
+          GITLAB2_NAMESPACE: ${{ vars.GITLAB2_NAMESPACE }}
+          GITLAB2_URL: ${{ vars.GITLAB2_URL }}
+          # --- Ziel 4: Google Drive ---
           GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_BACKUP_FOLDER_NAME: ${{ vars.GDRIVE_BACKUP_FOLDER_NAME }}
+          # --- Allgemeine Einstellungen ---
           QUIET_CONSOLE: "true"
           CLEAN_LOCAL_MIRROR_AFTER_EACH_REPO: "true"
           EMAIL_SUMMARY_FILE: "email_summary.txt"
+          MAX_RETRIES: "3"
+          RETRY_BASE_DELAY_SECONDS: "3"
         run: python backup_repos.py
 
-      # -----------------------------------------------------------------
-      # Benachrichtigung ueber GOOGLE CHAT statt E-Mail. Nur EIN Secret
-      # noetig (die Webhook-URL) - kein SMTP, kein App-Passwort, kein
-      # separates E-Mail-Konto. Die Webhook-URL ist selbst das Geheimnis
-      # (wer sie hat, kann in den Space schreiben) - bleibt daher als
-      # GitHub Secret, nirgendwo im Klartext sichtbar.
-      #
-      # if: always() sorgt dafuer, dass die Nachricht IMMER verschickt
-      # wird - egal ob der Backup-Schritt oben erfolgreich war oder
-      # fehlgeschlagen ist.
-      #
-      # Google Chat begrenzt Nachrichten auf max. 32.000 Byte - bei sehr
-      # vielen Fehlern wird das Protokoll daher auf die letzten ca.
-      # 4.000 Zeichen gekuerzt (siehe "tail" unten), damit der Versand
-      # nicht selbst fehlschlaegt.
-      # -----------------------------------------------------------------
+      # Benachrichtigung über Google Chat - läuft IMMER (if: always()),
+      # egal ob der Backup-Schritt oben erfolgreich war oder nicht.
       - name: Ergebnis an Google Chat senden
         if: always()
         env:
@@ -84,7 +91,6 @@ jobs:
           except FileNotFoundError:
               content = "Keine Zusammenfassung gefunden."
 
-          # Google Chat begrenzt Nachrichten auf 32.000 Byte - sicherheitshalber kuerzen
           max_len = 3500
           if len(content) > max_len:
               content = "...(gekuerzt)...\n" + content[-max_len:]
