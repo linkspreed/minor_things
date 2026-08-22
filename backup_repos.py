@@ -39,15 +39,71 @@
   verwendet wird. Der ANZEIGE-Name ("name"-Feld) bleibt unveraendert,
   nur der URL-Pfad ("path"-Feld) wird bereinigt.
 
-  FIX C) (NEU) Google-Drive-Upload-Reihenfolge:
+  FIX C) Google-Drive-Upload-Reihenfolge:
   Bisher wurde die alte ZIP-Datei ZUERST geloescht und DANACH die neue
   hochgeladen. Schlaegt der Upload fehl (z.B. Netzwerkfehler, auch nach
   allen Retries), gab es zwischenzeitlich GAR KEIN Backup mehr auf
   Google Drive fuer dieses Repo.
   LOESUNG: Reihenfolge umgedreht - ERST wird die neue ZIP-Datei
   hochgeladen, ERST DANACH (bei Erfolg) wird die alte Datei geloescht.
-  Dadurch gibt es zu keinem Zeitpunkt eine Luecke; es entsteht nur kurz
-  doppelter Speicherplatzbedarf (ein ZIP mehr, bis das alte geloescht ist).
+
+  ---------------------------------------------------------------
+  FIXES NACH DEM DRITTEN TESTLAUF (22.08.2026, abends):
+  ---------------------------------------------------------------
+
+  FIX D) Google-Drive-Suche in Shared Drives war UNZUVERLAESSIG:
+  `files().list()` findet Dateien/Ordner in einem Shared Drive NUR
+  zuverlaessig, wenn zusaetzlich zu `supportsAllDrives=True` und
+  `includeItemsFromAllDrives=True` auch `corpora="drive"` UND die
+  konkrete `driveId` des Shared Drives mitgegeben werden. Ohne das
+  lieferte die Suche nach der "alten" ZIP-Datei manchmal KEINEN
+  Treffer, obwohl die Datei existierte - das Skript lud dann eine
+  weitere, doppelte ZIP hoch, statt die alte zu ersetzen. Ueber
+  mehrere Laeufe hinweg haeuften sich so Dutzende Duplikate pro Repo
+  an (beobachtet: ~330 ZIPs statt ~156).
+  Das erklaert vermutlich auch die vorherigen "File not found beim
+  Loeschen"-Fehler: Der Such-Index eines Shared Drives ohne korrekte
+  `corpora`/`driveId`-Angabe kann veraltete/inkonsistente Treffer
+  liefern (Datei-ID wird gefunden, existiert aber schon nicht mehr).
+  LOESUNG:
+    - Beim ersten Zugriff wird EINMALIG die driveId des Shared Drives
+      ermittelt, in dem GDRIVE_FOLDER_ID liegt (ueber files().get).
+    - Ab dann verwenden ALLE Ordner-/Datei-Suchen `corpora="drive"`
+      und diese `driveId` - das ist die von Google empfohlene,
+      zuverlaessige Methode fuer Shared Drives.
+    - Falls GDRIVE_FOLDER_ID NICHT in einem Shared Drive liegt
+      (z.B. normale "Meine Ablage"), wird ganz normal ohne corpora/
+      driveId gesucht (Verhalten wie vorher, unveraendert).
+
+  FIX E) Alte Dateien wurden nur "irgendwie" (erste Seite) gesucht:
+  Die Suche nach existierenden ZIPs holte nur eine einzelne Ergebnis-
+  Seite. Bei bereits vorhandenen Duplikaten (z.B. durch FIX D
+  verursacht) wurden dadurch nicht alle Alt-Versionen gefunden/
+  bereinigt.
+  LOESUNG: Die Suche blaettert jetzt vollstaendig durch alle Seiten
+  (list_all_drive_files) und loescht ALLE gefundenen Alt-Dateien mit
+  demselben Namen - das Skript heilt bestehende Duplikate dadurch
+  von selbst ueber die naechsten paar Laeufe aus.
+
+  FIX F) 404 ("File not found") beim Loeschen wurde bisher wie ein
+  echter Fehler behandelt (3x wiederholt, dann als FEHLER gemeldet),
+  obwohl eine bereits nicht mehr existierende Datei zu loeschen
+  eigentlich KEIN Problem ist (Ziel "Datei soll weg sein" ist ja
+  laengst erreicht).
+  LOESUNG: Ein 404 beim Loeschen wird jetzt abgefangen, nur als Info
+  geloggt (nicht als Fehler gezaehlt) und NICHT mehr wiederholt.
+
+  FIX G) Ordner-Auswahl war nicht deterministisch, falls es (z.B.
+  durch Fix D verursacht) mehrere Ordner mit demselben Namen
+  "Repo_Backups" gab: `existing[0]` haette je nach Laufzeit-Zufall
+  mal den einen, mal den anderen Ordner zurueckgeben koennen - Dateien
+  waeren dann quer ueber zwei Ordner verteilt gelandet.
+  LOESUNG: Ordner-Suche nutzt jetzt `orderBy="createdTime"` und nimmt
+  IMMER konsequent den AELTESTEN Ordner. Werden mehrere Ordner
+  gleichen Namens gefunden, wird das zusaetzlich als Warnung geloggt,
+  damit man es manuell in Drive bereinigen kann (Duplikat-Ordner
+  automatisch zusammenzufuehren waere riskanter als einmal manuell
+  nachzusehen).
 
   ---------------------------------------------------------------
   BESTEHENDE FUNKTIONSWEISE:
@@ -459,12 +515,16 @@ def create_gitlab2_dated_project(dated_name: str) -> str:
 
 
 # ====================================================================
-#  4) GOOGLE DRIVE Backup (ueberschreibt - alte Zip wird ERST NACH
-#     erfolgreichem Upload der neuen Zip geloescht, siehe FIX C oben)
+#  4) GOOGLE DRIVE Backup
+#  (ueberschreibt - alte Zip wird ERST NACH erfolgreichem Upload der
+#  neuen Zip geloescht, siehe FIX C. Suche jetzt zuverlaessig ueber
+#  corpora="drive"+driveId, siehe FIX D/E/F/G oben im Modul-Docstring.)
 # ====================================================================
 
 _drive_service = None
 _drive_backup_folder_id = None
+_drive_shared_drive_id = None
+_drive_shared_drive_id_resolved = False
 
 
 def get_drive_service():
@@ -482,7 +542,106 @@ def get_drive_service():
     return _drive_service
 
 
+def get_shared_drive_id(service) -> str | None:
+    """
+    FIX D: Ermittelt EINMALIG die driveId des Shared Drives, in dem
+    GDRIVE_FOLDER_ID liegt (falls es ueberhaupt in einem Shared Drive
+    liegt - bei normaler "Meine Ablage" gibt es keine driveId, dann
+    wird None zurueckgegeben und ganz normal weitergesucht wie vorher).
+    Diese driveId wird danach bei JEDER Suche mit corpora="drive"
+    verwendet - das ist die von Google empfohlene, zuverlaessige
+    Methode fuer Suchen innerhalb von Shared Drives.
+    """
+    global _drive_shared_drive_id, _drive_shared_drive_id_resolved
+    if _drive_shared_drive_id_resolved:
+        return _drive_shared_drive_id
+
+    try:
+        info = with_retry(
+            lambda: service.files().get(
+                fileId=GDRIVE_FOLDER_ID, supportsAllDrives=True, fields="driveId",
+            ).execute(),
+            "Shared-Drive-ID ermitteln",
+        )
+        _drive_shared_drive_id = info.get("driveId")
+    except Exception as e:  # noqa: BLE001
+        summary_log(f"Hinweis: Shared-Drive-ID konnte nicht ermittelt werden ({e}) - "
+                    f"nutze Standard-Suche ohne corpora/driveId.")
+        _drive_shared_drive_id = None
+
+    _drive_shared_drive_id_resolved = True
+    if _drive_shared_drive_id:
+        summary_log(f"Shared-Drive erkannt (driveId ermittelt) - nutze zuverlaessige Drive-Suche.")
+    else:
+        summary_log(f"GDRIVE_FOLDER_ID liegt nicht in einem Shared Drive (oder driveId nicht ermittelbar) - "
+                    f"nutze Standard-Suche.")
+    return _drive_shared_drive_id
+
+
+def _drive_list_kwargs(service, query: str, fields: str):
+    """Baut die kwargs fuer files().list() - inkl. corpora/driveId, falls Shared Drive (FIX D)."""
+    kwargs = dict(
+        q=query, fields=fields,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        pageSize=100,
+    )
+    drive_id = get_shared_drive_id(service)
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    return kwargs
+
+
+def list_all_drive_files(service, query: str, fields: str = "files(id, name, createdTime)"):
+    """
+    FIX E: Blaettert vollstaendig durch ALLE Ergebnis-Seiten (nicht nur
+    die erste), damit auch mehrere bereits vorhandene Duplikate
+    zuverlaessig gefunden werden.
+    """
+    results = []
+    page_token = None
+    while True:
+        kwargs = _drive_list_kwargs(service, query, fields)
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = with_retry(
+            lambda kwargs=kwargs: service.files().list(**kwargs).execute(),
+            "Google-Drive-Suche",
+        )
+        results.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def delete_drive_file_if_exists(service, file_id: str, description: str):
+    """
+    FIX F: Ein 404 ("File not found") beim Loeschen bedeutet, dass die
+    Datei bereits nicht mehr existiert - das Ziel ist also schon
+    erreicht. Das wird jetzt NICHT mehr als Fehler gewertet und NICHT
+    mehr wiederholt (spart unnoetige Retry-Wartezeit).
+    """
+    try:
+        service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception as e:  # noqa: BLE001
+        if "404" in str(e) or "notFound" in str(e) or "File not found" in str(e):
+            summary_log(f"     ({description}: Datei war bereits geloescht - ok)")
+            return
+        # Bei allen anderen Fehlern (z.B. Netzwerk, 5xx) ganz normal mit Retry versuchen
+        with_retry(
+            lambda: service.files().delete(fileId=file_id, supportsAllDrives=True).execute(),
+            description,
+        )
+
+
 def ensure_drive_backup_folder(service) -> str:
+    """
+    FIX G: Nimmt bei mehreren gleichnamigen Ordnern IMMER konsequent
+    den AELTESTEN (orderBy=createdTime) - deterministisch statt
+    zufaellig. Warnt zusaetzlich im Log, falls Duplikate gefunden
+    wurden (damit man sie manuell zusammenfuehren/loeschen kann).
+    """
     global _drive_backup_folder_id
     if _drive_backup_folder_id:
         return _drive_backup_folder_id
@@ -491,15 +650,15 @@ def ensure_drive_backup_folder(service) -> str:
         f"name = '{GDRIVE_BACKUP_FOLDER_NAME}' and '{GDRIVE_FOLDER_ID}' in parents "
         f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     )
-    existing = with_retry(
-        lambda: service.files().list(
-            q=query, fields="files(id)",
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute().get("files", []),
-        "Google-Drive-Backup-Ordner suchen",
-    )
+    existing = list_all_drive_files(service, query, fields="files(id, createdTime)")
+    # Deterministisch sortieren: aeltester Ordner zuerst
+    existing.sort(key=lambda f: f.get("createdTime", ""))
 
     if existing:
+        if len(existing) > 1:
+            summary_log(f"WARNUNG: {len(existing)} Ordner namens '{GDRIVE_BACKUP_FOLDER_NAME}' gefunden - "
+                        f"verwende den aeltesten. Bitte pruefe/bereinige das manuell in Google Drive, "
+                        f"sonst koennen Backups auf mehrere Ordner verteilt werden.")
         _drive_backup_folder_id = existing[0]["id"]
         summary_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' gefunden (wird verwendet).")
         return _drive_backup_folder_id
@@ -523,11 +682,14 @@ def ensure_drive_backup_folder(service) -> str:
 
 def backup_to_drive(bare_path: Path, repo_name: str):
     """
-    FIX C: Reihenfolge geaendert - ERST wird die neue ZIP-Datei
-    hochgeladen, ERST DANACH (nur bei Erfolg) werden alte, gleichnamige
-    Dateien geloescht. Vorher: erst loeschen, dann hochladen - dadurch
-    gab es bei einem fehlgeschlagenen Upload zwischenzeitlich GAR KEIN
-    Backup auf Google Drive fuer dieses Repo.
+    Reihenfolge (FIX C): ERST wird die neue ZIP-Datei hochgeladen,
+    ERST DANACH (nur bei Erfolg) werden alte, gleichnamige Dateien
+    geloescht - so gibt es nie eine Luecke ohne Backup.
+
+    FIX D/E/F: Suche nach Alt-Dateien ist jetzt zuverlaessig (corpora/
+    driveId, vollstaendige Pagination) und loescht ALLE gefundenen
+    Alt-Versionen (heilt bestehende Duplikate von selbst aus). 404
+    beim Loeschen wird als "ok, schon weg" behandelt.
     """
     from googleapiclient.http import MediaFileUpload
 
@@ -543,17 +705,13 @@ def backup_to_drive(bare_path: Path, repo_name: str):
                 if file.is_file():
                     zf.write(file, arcname=str(file.relative_to(bare_path.parent)))
 
-        # --- Schritt 1: alte Datei(en) mit gleichem Namen VORAB nur SUCHEN (noch nicht loeschen) ---
+        # --- Schritt 1: ALLE alten Datei(en) mit gleichem Namen suchen (noch nicht loeschen) ---
         query = f"name = '{zip_name}' and '{target_folder_id}' in parents and trashed = false"
-        existing = with_retry(
-            lambda: service.files().list(
-                q=query, fields="files(id)",
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
-            ).execute().get("files", []),
-            f"alte Drive-Datei suchen ({repo_name})",
-        )
+        existing = list_all_drive_files(service, query, fields="files(id, createdTime)")
+        if len(existing) > 1:
+            summary_log(f"     ({len(existing)} alte Duplikate von '{zip_name}' gefunden - werden bereinigt)")
 
-        # --- Schritt 2: NEUE Datei hochladen (die alte bleibt bis hierhin unangetastet) ---
+        # --- Schritt 2: NEUE Datei hochladen (die alte(n) bleiben bis hierhin unangetastet) ---
         summary_log(f"  -> lade zu Google Drive hoch")
         media = MediaFileUpload(str(zip_path), mimetype="application/zip", resumable=True)
         with_retry(
@@ -566,12 +724,9 @@ def backup_to_drive(bare_path: Path, repo_name: str):
             f"Drive-Upload ({repo_name})",
         )
 
-        # --- Schritt 3: erst JETZT (nach erfolgreichem Upload) die alte(n) Datei(en) loeschen ---
+        # --- Schritt 3: erst JETZT (nach erfolgreichem Upload) ALLE alten Datei(en) loeschen ---
         for f in existing:
-            with_retry(
-                lambda f=f: service.files().delete(fileId=f["id"], supportsAllDrives=True).execute(),
-                f"alte Drive-Datei löschen ({repo_name})",
-            )
+            delete_drive_file_if_exists(service, f["id"], f"alte Drive-Datei löschen ({repo_name})")
 
 
 # ====================================================================
