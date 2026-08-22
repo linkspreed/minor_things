@@ -17,6 +17,13 @@
   Repos zusammen. Bei 155+ teils grossen Repos waere das nahezu
   garantiert sofort ausgeschoepft.)
 
+  WICHTIG ZU DEN VARIABLEN-NAMEN: GitHub reserviert das Praefix
+  "GITHUB_" fuer sich selbst - sowohl bei Secrets als auch bei
+  Variables darf KEIN eigener Name damit beginnen (Fehler: "Secret
+  names must not start with GITHUB_"). Deshalb heissen die Werte fuer
+  die Quelle und den Backup-Account hier "SRC_GH_..." und
+  "BACKUP_GH_..." statt "GITHUB_...".
+
   GOOGLE DRIVE: Dienstkonten (Service Accounts) haben KEIN eigenes
   Speicherkontingent und koennen NICHT in "Meine Ablage" hochladen -
   das schlaegt IMMER mit "storageQuotaExceeded" fehl. Es MUSS eine
@@ -75,14 +82,16 @@ def env(name, required=False, default=None):
     return val
 
 # --- Quelle: dein Haupt-GitHub-Account, dessen Repos gesichert werden
-GITHUB_SOURCE_TOKEN = env("GITHUB_SOURCE_TOKEN", required=True)
-GITHUB_SOURCE_OWNER = env("GITHUB_SOURCE_OWNER", required=True)
-GITHUB_SOURCE_OWNER_TYPE = env("GITHUB_SOURCE_OWNER_TYPE", default="user")  # "user" oder "org"
+#     (Namen mit "SRC_GH_" statt "GITHUB_", da GitHub das Praefix
+#     "GITHUB_" fuer eigene Secrets/Variables reserviert hat)
+SRC_GH_TOKEN = env("SRC_GH_TOKEN", required=True)
+SRC_GH_OWNER = env("SRC_GH_OWNER", required=True)
+SRC_GH_OWNER_TYPE = env("SRC_GH_OWNER_TYPE", default="user")  # "user" oder "org"
 
 # --- Ziel 1: zweiter GitHub-Account (optional, leer lassen zum Deaktivieren)
-GITHUB_BACKUP_TOKEN = env("GITHUB_BACKUP_TOKEN")
-GITHUB_BACKUP_OWNER = env("GITHUB_BACKUP_OWNER")
-GITHUB_BACKUP_OWNER_TYPE = env("GITHUB_BACKUP_OWNER_TYPE", default="user")
+BACKUP_GH_TOKEN = env("BACKUP_GH_TOKEN")
+BACKUP_GH_OWNER = env("BACKUP_GH_OWNER")
+BACKUP_GH_OWNER_TYPE = env("BACKUP_GH_OWNER_TYPE", default="user")
 
 # --- Ziel 2: GitLab (optional)
 GITLAB_TOKEN = env("GITLAB_TOKEN")
@@ -92,8 +101,8 @@ GITLAB_URL = env("GITLAB_URL", default="https://gitlab.com")
 # --- Ziel 3: Google Drive (optional) ---------------------------------
 # GDRIVE_FOLDER_ID MUSS die ID einer GETEILTEN ABLAGE (Shared Drive) sein,
 # oder eines Ordners INNERHALB einer geteilten Ablage - NICHT "Meine
-# Ablage"! Service Accounts haben kein eigenes Speicherkontingent und
-# koennen dort nichts anlegen (siehe Modul-Docstring oben).
+# Ablage"! Service Accounts haben kein eigenes Speicherkontingent (siehe
+# Modul-Docstring oben).
 GDRIVE_FOLDER_ID = env("GDRIVE_FOLDER_ID")          # ID der geteilten Ablage / des Ordners darin
 GDRIVE_SA_JSON = env("GDRIVE_SA_JSON")              # Inhalt des Service-Account-JSON-Keys (als Text)
 GDRIVE_BACKUP_FOLDER_NAME = env("GDRIVE_BACKUP_FOLDER_NAME", default="Repo_Backups")
@@ -119,7 +128,7 @@ QUIET_CONSOLE = env("QUIET_CONSOLE", default="true").lower() == "true"
 # Alle Geheimnisse sammeln, damit wir sie aus Konsolen-Ausgaben rausfiltern
 # koennen, falls doch mal (z.B. bei einem Python-Traceback) etwas auftaucht.
 _SECRETS = [s for s in [
-    GITHUB_SOURCE_TOKEN, GITHUB_BACKUP_TOKEN, GITLAB_TOKEN, GDRIVE_SA_JSON,
+    SRC_GH_TOKEN, BACKUP_GH_TOKEN, GITLAB_TOKEN, GDRIVE_SA_JSON,
 ] if s]
 
 
@@ -182,13 +191,13 @@ def now_iso():
 def list_source_repos():
     repos = []
     page = 1
-    base = (f"https://api.github.com/orgs/{GITHUB_SOURCE_OWNER}/repos"
-            if GITHUB_SOURCE_OWNER_TYPE == "org"
+    base = (f"https://api.github.com/orgs/{SRC_GH_OWNER}/repos"
+            if SRC_GH_OWNER_TYPE == "org"
             else "https://api.github.com/user/repos")
-    headers = {"Authorization": f"token {GITHUB_SOURCE_TOKEN}", "Accept": "application/vnd.github+json"}
+    headers = {"Authorization": f"token {SRC_GH_TOKEN}", "Accept": "application/vnd.github+json"}
     while True:
         params = {"per_page": 100, "page": page}
-        if GITHUB_SOURCE_OWNER_TYPE != "org":
+        if SRC_GH_OWNER_TYPE != "org":
             params["affiliation"] = "owner"
         r = requests.get(base, headers=headers, params=params, timeout=60)
         r.raise_for_status()
@@ -235,13 +244,13 @@ def cleanup_local_mirror(bare_path: Path):
 # ====================================================================
 
 def ensure_github_target_repo(name: str):
-    headers = {"Authorization": f"token {GITHUB_BACKUP_TOKEN}", "Accept": "application/vnd.github+json"}
-    check_url = f"https://api.github.com/repos/{GITHUB_BACKUP_OWNER}/{name}"
+    headers = {"Authorization": f"token {BACKUP_GH_TOKEN}", "Accept": "application/vnd.github+json"}
+    check_url = f"https://api.github.com/repos/{BACKUP_GH_OWNER}/{name}"
     r = requests.get(check_url, headers=headers, timeout=30)
     if r.status_code == 200:
         return
-    create_url = (f"https://api.github.com/orgs/{GITHUB_BACKUP_OWNER}/repos"
-                   if GITHUB_BACKUP_OWNER_TYPE == "org" else "https://api.github.com/user/repos")
+    create_url = (f"https://api.github.com/orgs/{BACKUP_GH_OWNER}/repos"
+                   if BACKUP_GH_OWNER_TYPE == "org" else "https://api.github.com/user/repos")
     r = requests.post(create_url, headers=headers, json={"name": name, "private": True}, timeout=30)
     if r.status_code not in (201, 422):
         raise RuntimeError(redact(f"GitHub-Backup-Repo konnte nicht angelegt werden: {r.text}"))
@@ -381,12 +390,12 @@ def process_repo(repo: dict) -> bool:
     email_log(f"--- {name} ---")
     bare_path = None
     try:
-        source_url = repo["clone_url"].replace("https://", f"https://{GITHUB_SOURCE_TOKEN}@")
+        source_url = repo["clone_url"].replace("https://", f"https://{SRC_GH_TOKEN}@")
         bare_path = mirror_clone_local(name, source_url)
 
-        if GITHUB_BACKUP_TOKEN and GITHUB_BACKUP_OWNER:
+        if BACKUP_GH_TOKEN and BACKUP_GH_OWNER:
             ensure_github_target_repo(name)
-            target = f"https://{GITHUB_BACKUP_TOKEN}@github.com/{GITHUB_BACKUP_OWNER}/{name}.git"
+            target = f"https://{BACKUP_GH_TOKEN}@github.com/{BACKUP_GH_OWNER}/{name}.git"
             push_mirror(bare_path, target, "GitHub-Backup-Account")
 
         if GITLAB_TOKEN and GITLAB_NAMESPACE:
