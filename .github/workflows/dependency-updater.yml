@@ -1,0 +1,34 @@
+name: Dependency-Updater-Rollout
+
+on:
+  schedule:
+    - cron: '0 5 1 * *'   # monatlich, am 1. um 05:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: dependency-updater
+  cancel-in-progress: false
+
+jobs:
+  rollout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Dependabot-Konfiguration ausrollen
+        env:
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: python dependency_updater.py

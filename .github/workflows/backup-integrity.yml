@@ -1,0 +1,41 @@
+name: Backup-Integritaetspruefung
+
+on:
+  schedule:
+    # Taeglich um 01:30 UTC - zeitversetzt nach dem 00:00-UTC-Backup-Lauf,
+    # damit der neueste Backup-Stand schon ueberall angekommen ist.
+    - cron: '30 1 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: backup-integrity
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Integrität prüfen
+        env:
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          BACKUP_GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
+          BACKUP_GH_OWNER: ${{ vars.BACKUP_GH_OWNER }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_NAMESPACE: ${{ vars.GITLAB_NAMESPACE }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: python backup_integrity.py

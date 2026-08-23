@@ -1,0 +1,39 @@
+name: Groessen-Kosten-Waechter
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'   # woechentlich, sonntags 04:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: size-guard
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Größen prüfen
+        env:
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_NAMESPACE: ${{ vars.GITLAB_NAMESPACE }}
+          GITLAB_URL: ${{ vars.GITLAB_URL }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          SIZE_WARNING_THRESHOLD_MB: "500"
+        run: python size_guard.py
