@@ -1,11 +1,55 @@
 #!/usr/bin/env python3
 """
 ====================================================================
-  PATCH: VOLLSTAENDIGKEIT & VERIFIKATION
+  GITHUB REPO SUPER-BACKUP  (Public-Repo-Safe Version + Google Chat)
 --------------------------------------------------------------------
-  Drop-in-Ersatz fuer die betroffenen Funktionen aus backup.py.
-  Behebt die Ursachen fuer "Repo ist da, aber nicht alle Branches"
-  und "Repo fehlt komplett".
+  Spiegelt ALLE Repos eines GitHub-Accounts (voller Verlauf, alle
+  Branches, alle Tags) automatisch nach VIER Zielen, alle 6 Stunden
+  (4x taeglich):
+
+    1) einem ZWEITEN GitHub-Account      (echtes Git-Mirror, ueberschreibt)
+    2) GitLab-Account #1                  (echtes Git-Mirror, ueberschreibt)
+    3) GitLab-Account #2                  (NEUES, datiertes Projekt JEDEN Lauf)
+    4) Google Drive                       (ZIP, alte Version wird ersetzt)
+
+  ---------------------------------------------------------------
+  FIXES A-C (nach dem zweiten Testlauf, 22.08.2026)
+  ---------------------------------------------------------------
+
+  FIX A) "deny updating a hidden ref": `git clone --mirror` kopiert
+  auch GitHubs interne PR-Referenzen (refs/pull/...). Die darf man im
+  Ziel nicht schreiben. Statt `--mirror` wird deshalb gezielt nur
+  refs/heads/* und refs/tags/* gepusht, mit --prune.
+
+  FIX B) GitLab verbietet Projekt-PFADE, die mit '-', '_' oder '.'
+  beginnen oder enden. sanitize_gitlab_path() bereinigt den Pfad; der
+  Anzeigename bleibt unveraendert.
+
+  FIX C) Google Drive: ERST die neue ZIP hochladen, DANN die alte
+  loeschen - sonst gibt es bei einem fehlgeschlagenen Upload
+  zwischenzeitlich gar kein Backup mehr.
+
+  ---------------------------------------------------------------
+  FIXES D-G (nach dem dritten Testlauf, 22.08.2026 abends)
+  ---------------------------------------------------------------
+
+  FIX D) Suchen in einem Shared Drive funktionieren nur zuverlaessig
+  mit corpora="drive" UND der konkreten driveId. Ohne das wurden alte
+  ZIPs nicht gefunden und Duplikate angehaeuft (~330 statt ~156).
+
+  FIX E) Die Suche blaettert jetzt durch ALLE Ergebnisseiten und
+  loescht alle gleichnamigen Alt-Dateien - bestehende Duplikate heilen
+  dadurch von selbst aus.
+
+  FIX F) Ein 404 beim Loeschen ist kein Fehler (Datei ist ja weg) und
+  wird nicht mehr wiederholt.
+
+  FIX G) Bei mehreren gleichnamigen Backup-Ordnern wird immer
+  deterministisch der aelteste genommen (orderBy createdTime).
+
+  ---------------------------------------------------------------
+  FIXES H-O (Vollstaendigkeit & Verifikation)
+  ---------------------------------------------------------------
 
   FIX H) ATOMARER PUSH
     Ohne --atomic verarbeitet der Server jede Ref EINZELN. Scheitern
@@ -15,66 +59,210 @@
     3 Refs erneut scheitern. Mit --atomic gilt: alles oder nichts.
 
   FIX I) VERIFIKATION NACH DEM PUSH
-    Bisher wurde NIE geprueft, ob das Ziel wirklich hat, was die Quelle
-    hat. verify_refs() vergleicht Ref-Name UND Commit-SHA zwischen
-    lokalem Mirror und Ziel (via git ls-remote) und meldet fehlende
-    bzw. abweichende Refs NAMENTLICH. Ohne diesen Schritt ist jede
-    weitere Fehlersuche Raterei.
+    Bisher wurde NIE geprueft, ob das Ziel wirklich hat, was die
+    Quelle hat. verify_refs() vergleicht Ref-Name UND Commit-SHA
+    zwischen lokalem Mirror und Ziel (via git ls-remote) und meldet
+    fehlende bzw. abweichende Refs NAMENTLICH.
 
   FIX J) RATE-LIMITS (429 / 403 secondary) WERDEN WIEDERHOLT
-    Bisher wurde nur bei HTTP >= 500 wiederholt. Rate-Limits kommen
-    aber als 429 bzw. bei GitHub als 403 mit Retry-After-Header und
-    fielen komplett durch das Raster: Eine gedrosselte Existenzpruefung
-    lieferte "nicht 200" -> das Skript hielt das Projekt fuer nicht
-    vorhanden -> Anlage scheiterte -> Repo fehlte im Ziel.
+    Bisher wurde nur bei HTTP >= 500 wiederholt. Eine gedrosselte
+    Existenzpruefung lieferte "nicht 200" -> das Skript hielt das
+    Projekt fuer nicht vorhanden -> Anlage scheiterte -> Repo fehlte.
 
   FIX K) KOLLISIONSSICHERE GITLAB-PFADE
     sanitize_gitlab_path() bildete verschiedene Repos auf denselben
-    Pfad ab ("World-ID-" und "World-ID" -> beide "World-ID"). Das
-    zweite Repo pushte mit force+prune ueber das erste. Jetzt haengt
-    bei jeder Aenderung ein kurzer Hash des Originalnamens an -> die
-    Abbildung ist wieder eindeutig und stabil ueber alle Laeufe.
+    Pfad ab ("World-ID-" und "World-ID"). Das zweite pushte mit
+    force+prune ueber das erste. Jetzt haengt bei jeder Aenderung ein
+    kurzer Hash des Originalnamens an.
 
   FIX L) GIT-LFS-OBJEKTE
     `git clone --mirror` kopiert nur LFS-Pointer, nicht die Inhalte.
-    fetch_lfs_objects() holt sie nach, sofern das Repo LFS nutzt.
 
   FIX M) ROBUSTERE GIT-UEBERTRAGUNG GROSSER REPOS
-    postBuffer hochgesetzt und Kompression reduziert - beugt
-    Abbruechen ("RPC failed", "early EOF") bei grossen Pushes vor.
+    postBuffer hoch, Kompression runter - beugt "RPC failed" und
+    "early EOF" bei grossen Pushes vor.
 
   FIX N) DEFAULT-BRANCH IM ZIEL SETZEN
     Neu angelegte GitHub-Repos haben HEAD auf 'main'. Heisst der
-    Quell-Default 'master', zeigt HEAD im Backup ins Leere und das
-    Repo wirkt leer, obwohl alle Daten da sind.
+    Quell-Default 'master', wirkt das Backup leer.
 
   FIX O) PLATTENPLATZ-WAECHTER
     Mirror + ZIP liegen gleichzeitig auf derselben Disk (~2x
-    Repogroesse). Laeuft sie voll, scheitert schon der Klon und das
-    Repo fehlt in ALLEN Zielen. Wird jetzt vorher geprueft und
-    geloggt.
+    Repogroesse). Laeuft sie voll, fehlt das Repo in ALLEN Zielen.
+
+  ---------------------------------------------------------------
+  BESTEHENDE FUNKTIONSWEISE
+  ---------------------------------------------------------------
+
+  ZIEL 3 (GitLab-Account #2) legt bei JEDEM Lauf ein KOMPLETT NEUES
+  Projekt an, benannt nach dem Schema:
+
+      <repo-name>_<TT>_<MM>_<JJJJ>_<hh>_<mm>_<am/pm>
+
+  Das ist die Absicherung gegen Force-Push/History-Rewrite im
+  Original: Die ueberschreibenden Mirrors wuerden so eine Manipulation
+  beim naechsten Lauf brav nachvollziehen - bei GitLab-Account #2
+  bleibt jeder jemals gesicherte Stand fuer immer bestehen.
+
+  Der Zeitstempel ist UTC (Actions-Runner laufen in UTC) und kann
+  daher von der lokalen Uhrzeit abweichen. Das ist kein Fehler.
+
+  Jedes Ziel hat einen EIGENEN try/except-Block pro Repo - schlaegt
+  eines fehl, werden die anderen fuer dasselbe Repo trotzdem versucht.
+
+  DESIGN-ZIEL: Laeuft in einem OEFFENTLICHEN GitHub-Repo, OHNE dass
+  aus den Actions-Logs ablesbar ist, welche Repos gesichert werden
+  (Konsole zeigt nur "Repo 3/156"). Alle Details landen ausschliesslich
+  in der Zusammenfassungsdatei.
+
+  FESTPLATTEN-MANAGEMENT: Standard-Runner haben nur 14 GB SSD. Nach
+  jedem einzelnen Repo wird der lokale Mirror-Ordner SOFORT geloescht.
 ====================================================================
 """
 
 import hashlib
+import json
+import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
+import traceback
+import urllib.parse
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
-# --------------------------------------------------------------------
-# Diese Namen kommen aus backup.py. Beim Einbau des Patches direkt
-# dort ersetzen; der Import hier dient nur der Eigenstaendigkeit.
-# --------------------------------------------------------------------
-try:
-    from backup import (  # noqa: F401
-        summary_log, redact, with_retry, run,
-        MAX_RETRIES, RETRY_BASE_DELAY_SECONDS, GIT_TIMEOUT_SECONDS,
-    )
-except ImportError:  # Patch wird als Referenz gelesen, nicht importiert
-    pass
+# ====================================================================
+#  CONFIG - alles kommt aus Umgebungsvariablen (siehe .env.example)
+# ====================================================================
+
+
+def env(name, required=False, default=None):
+    val = os.environ.get(name, default)
+    if required and not val:
+        print("FEHLER: Pflicht-Konfiguration fehlt (Name absichtlich nicht angezeigt).")
+        sys.exit(1)
+    return val
+
+
+# --- Quelle: dein Haupt-GitHub-Account, dessen Repos gesichert werden
+SRC_GH_TOKEN = env("SRC_GH_TOKEN", required=True)
+SRC_GH_OWNER = env("SRC_GH_OWNER", required=True)
+SRC_GH_OWNER_TYPE = env("SRC_GH_OWNER_TYPE", default="user")
+
+# --- Ziel 1: zweiter GitHub-Account (optional, ueberschreibt)
+BACKUP_GH_TOKEN = env("BACKUP_GH_TOKEN")
+BACKUP_GH_OWNER = env("BACKUP_GH_OWNER")
+BACKUP_GH_OWNER_TYPE = env("BACKUP_GH_OWNER_TYPE", default="user")
+
+# --- Ziel 2: GitLab-Account #1 (optional, ueberschreibt/mirrort)
+GITLAB_TOKEN = env("GITLAB_TOKEN")
+GITLAB_NAMESPACE = env("GITLAB_NAMESPACE")
+GITLAB_URL = env("GITLAB_URL", default="https://gitlab.com")
+
+# --- Ziel 3: GitLab-Account #2 (optional, legt JEDEN Lauf neue,
+#     datierte Projekte an - siehe Modul-Docstring oben)
+GITLAB2_TOKEN = env("GITLAB2_TOKEN")
+GITLAB2_NAMESPACE = env("GITLAB2_NAMESPACE")
+GITLAB2_URL = env("GITLAB2_URL", default="https://gitlab.com")
+
+# --- Ziel 4: Google Drive (optional)
+GDRIVE_FOLDER_ID = env("GDRIVE_FOLDER_ID")
+GDRIVE_SA_JSON = env("GDRIVE_SA_JSON")
+GDRIVE_BACKUP_FOLDER_NAME = env("GDRIVE_BACKUP_FOLDER_NAME", default="Repo_Backups")
+
+# --- Zusammenfassung fuer Benachrichtigung (Google Chat, siehe backup.yml)
+SUMMARY_FILE = Path(env("EMAIL_SUMMARY_FILE", default="email_summary.txt"))
+
+# --- Allgemein
+WORKDIR = Path(env("BACKUP_WORKDIR", default="mirrors"))
+GIT_TIMEOUT_SECONDS = int(env("GIT_TIMEOUT_SECONDS", default="1800"))
+
+CLEAN_LOCAL_MIRROR_AFTER_EACH_REPO = env(
+    "CLEAN_LOCAL_MIRROR_AFTER_EACH_REPO", default="true"
+).lower() == "true"
+QUIET_CONSOLE = env("QUIET_CONSOLE", default="true").lower() == "true"
+
+MAX_RETRIES = int(env("MAX_RETRIES", default="3"))
+RETRY_BASE_DELAY_SECONDS = float(env("RETRY_BASE_DELAY_SECONDS", default="3"))
+
+_SECRETS = [s for s in [
+    SRC_GH_TOKEN, BACKUP_GH_TOKEN, GITLAB_TOKEN, GITLAB2_TOKEN, GDRIVE_SA_JSON,
+] if s]
+
+
+def redact(text: str) -> str:
+    for s in _SECRETS:
+        if s and s in text:
+            text = text.replace(s, "***REDACTED***")
+    return text
+
+
+# ====================================================================
+#  LOGGING: Konsole = anonym/leer. Summary-Datei = vollstaendig.
+# ====================================================================
+
+SUMMARY_LINES = []
+_repo_total = 0
+_repo_index = 0
+
+
+def summary_log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    SUMMARY_LINES.append(f"[{ts}] {redact(str(msg))}")
+
+
+def console_heartbeat(msg: str = None):
+    if QUIET_CONSOLE:
+        if msg:
+            print(msg, flush=True)
+        else:
+            print(f"... Verarbeite Repo {_repo_index}/{_repo_total} ...", flush=True)
+    else:
+        print(msg or f"Repo {_repo_index}/{_repo_total}", flush=True)
+
+
+# ====================================================================
+#  RETRY-HELFER
+# ====================================================================
+
+
+def with_retry(func, description: str):
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return func()
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_BASE_DELAY_SECONDS * attempt
+                summary_log(f"     (Versuch {attempt}/{MAX_RETRIES} fehlgeschlagen bei "
+                            f"'{description}': {e} - neuer Versuch in {delay:.0f}s)")
+                time.sleep(delay)
+            else:
+                summary_log(f"     (Endgueltig fehlgeschlagen nach {MAX_RETRIES} "
+                            f"Versuchen bei '{description}': {e})")
+    raise last_error
+
+
+def run(cmd, cwd=None, timeout=GIT_TIMEOUT_SECONDS, description: str = None):
+    def _attempt():
+        try:
+            result = subprocess.run(
+                cmd, cwd=cwd, check=True, capture_output=True, text=True, timeout=timeout,
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(redact(f"Git-Befehl fehlgeschlagen: {e.stderr}"))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Timeout nach {timeout}s bei einem Git-Befehl.")
+
+    return with_retry(_attempt, description or " ".join(cmd[:2]))
 
 
 # ====================================================================
@@ -86,8 +274,8 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 def _retry_after_seconds(response, attempt: int) -> float:
     """
-    Liest Retry-After bzw. die GitHub-/GitLab-RateLimit-Header aus und
-    leitet daraus die Wartezeit ab. Fallback: exponentielles Backoff.
+    Liest Retry-After bzw. die RateLimit-Header aus und leitet daraus
+    die Wartezeit ab. Fallback: exponentielles Backoff.
     """
     header = response.headers.get("Retry-After")
     if header:
@@ -120,7 +308,6 @@ def _is_secondary_rate_limit(response) -> bool:
 def http_request(method, url, *, headers=None, params=None, json_body=None,
                  auth=None, timeout=30, description=None):
     """
-    Ersetzt http_get() und http_post().
     Wiederholt jetzt auch bei 429 und bei GitHubs 403-Secondary-Limit -
     und respektiert dabei den Retry-After-Header, statt blind zu warten.
     """
@@ -137,7 +324,8 @@ def http_request(method, url, *, headers=None, params=None, json_body=None,
             last_error = e
             if attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY_SECONDS * attempt
-                summary_log(f"     (Netzwerkfehler bei '{label}': {e} - neuer Versuch in {delay:.0f}s)")
+                summary_log(f"     (Netzwerkfehler bei '{label}': {e} - "
+                            f"neuer Versuch in {delay:.0f}s)")
                 time.sleep(delay)
                 continue
             raise RuntimeError(redact(f"Netzwerkfehler bei '{label}': {e}"))
@@ -149,7 +337,8 @@ def http_request(method, url, *, headers=None, params=None, json_body=None,
                             f"und versuche erneut, Versuch {attempt}/{MAX_RETRIES})")
                 time.sleep(delay)
                 continue
-            summary_log(f"     (HTTP {r.status_code} bei '{label}' auch nach {MAX_RETRIES} Versuchen)")
+            summary_log(f"     (HTTP {r.status_code} bei '{label}' auch nach "
+                        f"{MAX_RETRIES} Versuchen)")
 
         return r
 
@@ -171,16 +360,35 @@ def http_patch(url, headers=None, json_body=None, timeout=30, description=None):
                         timeout=timeout, description=description)
 
 
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def make_run_timestamp_suffix() -> str:
+    """
+    Erzeugt EINEN Zeitstempel fuer den GESAMTEN Lauf. Format:
+    TT_MM_JJJJ_hh_mm_am/pm, in UTC. Beispiel: 22_08_2026_07_10_pm
+    """
+    now = datetime.now(timezone.utc)
+    date_part = now.strftime("%d_%m_%Y")
+    time_part = now.strftime("%I_%M_%p").lower()
+    return f"{date_part}_{time_part}"
+
+
 # ====================================================================
-#  FIX K: kollisionssichere GitLab-Pfade
+#  FIX B + K: kollisionssichere GitLab-Pfad-Bereinigung
 # ====================================================================
+
 
 def sanitize_gitlab_path(name: str) -> str:
     """
-    Wie vorher, ABER: Sobald der Name veraendert werden muss, wird ein
-    kurzer, stabiler Hash des Originalnamens angehaengt. Damit koennen
-    zwei verschiedene Repos nicht mehr auf denselben Pfad fallen und
-    sich gegenseitig ueberschreiben.
+    GitLab-Projekt-Pfade duerfen nicht mit '-', '_' oder '.' beginnen
+    oder enden und nur Buchstaben/Ziffern/'-'/'_'/'.' enthalten.
+
+    FIX K: Sobald der Name veraendert werden muss, wird ein kurzer,
+    stabiler Hash des Originalnamens angehaengt. Damit koennen zwei
+    verschiedene Repos nicht mehr auf denselben Pfad fallen und sich
+    gegenseitig ueberschreiben.
 
       "World-ID-"  -> "World-ID-a3f19c"
       "World-ID"   -> "World-ID"          (unveraendert, kein Hash)
@@ -215,8 +423,59 @@ GIT_BIG_REPO_OPTS = [
 
 
 # ====================================================================
+#  1) QUELLE: Repo-Liste von GitHub holen
+# ====================================================================
+
+
+def list_source_repos():
+    repos = []
+    page = 1
+    base = (f"https://api.github.com/orgs/{SRC_GH_OWNER}/repos"
+            if SRC_GH_OWNER_TYPE == "org"
+            else "https://api.github.com/user/repos")
+    headers = {"Authorization": f"token {SRC_GH_TOKEN}",
+               "Accept": "application/vnd.github+json"}
+    while True:
+        params = {"per_page": 100, "page": page}
+        if SRC_GH_OWNER_TYPE != "org":
+            params["affiliation"] = "owner"
+        r = http_get(base, headers=headers, params=params, timeout=60,
+                     description="Quell-Repos auflisten")
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        repos.extend(batch)
+        page += 1
+    return repos
+
+
+# ====================================================================
+#  2) LOKALES BARE-MIRROR anlegen (immer frisch)
+# ====================================================================
+
+
+def mirror_clone_local(repo_name: str, source_clone_url_with_token: str) -> Path:
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    bare_path = WORKDIR / f"{repo_name}.git"
+    if bare_path.exists():
+        shutil.rmtree(bare_path)
+    summary_log(f"  -> klone {repo_name}")
+    run(["git"] + GIT_BIG_REPO_OPTS +
+        ["clone", "--mirror", source_clone_url_with_token, str(bare_path)],
+        description=f"klonen {repo_name}")
+    return bare_path
+
+
+def cleanup_local_mirror(bare_path: Path):
+    if CLEAN_LOCAL_MIRROR_AFTER_EACH_REPO and bare_path and bare_path.exists():
+        shutil.rmtree(bare_path, ignore_errors=True)
+
+
+# ====================================================================
 #  FIX H + I: atomarer Push MIT Verifikation
 # ====================================================================
+
 
 def local_refs(bare_path) -> dict:
     """Alle Branches und Tags des lokalen Mirrors als {refname: sha}."""
@@ -240,7 +499,8 @@ def remote_refs(target_url_with_token: str, label: str) -> dict:
     nicht faelschlich als Abweichung gelten.
     """
     out = run(
-        ["git"] + GIT_BIG_REPO_OPTS + ["ls-remote", "--heads", "--tags", target_url_with_token],
+        ["git"] + GIT_BIG_REPO_OPTS +
+        ["ls-remote", "--heads", "--tags", target_url_with_token],
         description=f"Refs im Ziel auflisten ({label})",
     )
     refs = {}
@@ -253,12 +513,11 @@ def remote_refs(target_url_with_token: str, label: str) -> dict:
 
 def verify_refs(bare_path, target_url_with_token: str, label: str, repo_name: str) -> bool:
     """
-    FIX I - der eigentlich entscheidende Baustein.
+    FIX I - der entscheidende Baustein.
 
     Vergleicht Quelle und Ziel Ref fuer Ref. Meldet FEHLENDE und
     ABWEICHENDE Refs namentlich in die Zusammenfassung. Ohne diese
-    Pruefung bleibt ein unvollstaendiges Backup unsichtbar - genau
-    das war das Kernproblem.
+    Pruefung bleibt ein unvollstaendiges Backup unsichtbar.
     """
     src = local_refs(bare_path)
     dst = remote_refs(target_url_with_token, label)
@@ -276,23 +535,25 @@ def verify_refs(bare_path, target_url_with_token: str, label: str, repo_name: st
                     + (" ..." if len(missing) > 20 else ""))
     if mismatched:
         summary_log(f"  !! ABWEICHEND {label} bei {repo_name}: "
-                    f"{len(mismatched)} Refs zeigen auf anderen Commit: {', '.join(mismatched[:20])}"
+                    f"{len(mismatched)} Refs zeigen auf anderen Commit: "
+                    f"{', '.join(mismatched[:20])}"
                     + (" ..." if len(mismatched) > 20 else ""))
     return False
 
 
-def push_branches_and_tags(bare_path, target_url_with_token: str, label: str, repo_name: str = "") -> bool:
+def push_branches_and_tags(bare_path, target_url_with_token: str,
+                           label: str, repo_name: str = "") -> bool:
     """
-    Ersetzt die alte push_branches_and_tags().
+    FIX A: Statt `git push --mirror` werden gezielt nur Branches und
+    Tags gepusht - das umgeht GitHubs interne PR-Referenzen.
 
     FIX H: --atomic. Damit gibt es keinen halb uebertragenen Zustand
-    mehr. Entweder alle Refs kommen an, oder keine - und der Fehler
-    ist dann eindeutig sichtbar statt als scheinbar befuelltes Repo
-    getarnt.
+    mehr. Entweder alle Refs kommen an, oder keine - und der Fehler ist
+    dann eindeutig sichtbar statt als scheinbar befuelltes Repo getarnt.
 
     FIX I: Nach dem Push wird IMMER verifiziert - auch wenn der Push
-    "Everything up-to-date" meldete. Denn genau dieser Fall hat
-    bisher unvollstaendige Ziele als in Ordnung durchgewunken.
+    "Everything up-to-date" meldete. Genau dieser Fall hat bisher
+    unvollstaendige Ziele als in Ordnung durchgewunken.
 
     Rueckgabewert: True nur, wenn Push UND Verifikation sauber sind.
     """
@@ -332,19 +593,20 @@ def push_branches_and_tags(bare_path, target_url_with_token: str, label: str, re
 #  FIX L: Git-LFS-Objekte mitsichern
 # ====================================================================
 
+
 def fetch_lfs_objects(bare_path, source_url_with_token: str, repo_name: str):
     """
     `git clone --mirror` kopiert nur die LFS-POINTER, nicht die
-    Dateiinhalte. Ohne diesen Schritt ist das Backup bei LFS-Repos
-    in allen vier Zielen unvollstaendig - ohne jede Fehlermeldung.
+    Dateiinhalte. Ohne diesen Schritt ist das Backup bei LFS-Repos in
+    allen vier Zielen unvollstaendig - ohne jede Fehlermeldung.
     """
     if shutil.which("git-lfs") is None:
         return
-
     try:
-        run(["git", "--git-dir", str(bare_path), "lfs", "fetch", "--all", source_url_with_token],
+        run(["git", "--git-dir", str(bare_path), "lfs", "fetch", "--all",
+             source_url_with_token],
             description=f"LFS-Objekte holen ({repo_name})")
-        summary_log(f"     (LFS-Objekte gesichert)")
+        summary_log("     (LFS-Objekte gesichert)")
     except RuntimeError as e:
         text = str(e).lower()
         if "not a valid" in text or "no lfs" in text or "does not appear" in text:
@@ -356,15 +618,114 @@ def push_lfs_objects(bare_path, target_url_with_token: str, label: str, repo_nam
     if shutil.which("git-lfs") is None:
         return
     try:
-        run(["git", "--git-dir", str(bare_path), "lfs", "push", "--all", target_url_with_token],
+        run(["git", "--git-dir", str(bare_path), "lfs", "push", "--all",
+             target_url_with_token],
             description=f"LFS-Objekte pushen nach {label}")
     except RuntimeError as e:
         summary_log(f"  !! LFS-Push-Warnung {label} bei {repo_name}: {e}")
 
 
 # ====================================================================
+#  3) ZIEL-REPOS bei Bedarf anlegen
+# ====================================================================
+
+
+def ensure_github_target_repo(name: str):
+    """Ziel 1: Direkter Lookup, legt bei Bedarf EINMALIG an."""
+    headers = {"Authorization": f"token {BACKUP_GH_TOKEN}",
+               "Accept": "application/vnd.github+json"}
+    check_url = f"https://api.github.com/repos/{BACKUP_GH_OWNER}/{name}"
+    r = http_get(check_url, headers=headers, timeout=30,
+                 description=f"GitHub-Backup-Repo pruefen ({name})")
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        # Weder "existiert" noch "existiert nicht" - nicht blind anlegen.
+        raise RuntimeError(redact(f"Unklare Antwort HTTP {r.status_code} bei "
+                                  f"Pruefung von '{name}': {r.text[:200]}"))
+
+    create_url = (f"https://api.github.com/orgs/{BACKUP_GH_OWNER}/repos"
+                  if BACKUP_GH_OWNER_TYPE == "org" else "https://api.github.com/user/repos")
+    r = http_post(create_url, headers=headers, json_body={"name": name, "private": True},
+                  timeout=30, description=f"GitHub-Backup-Repo anlegen ({name})")
+    if r.status_code not in (201, 422):
+        raise RuntimeError(redact(f"GitHub-Backup-Repo konnte nicht angelegt werden: {r.text}"))
+    summary_log(f"  -> GitHub-Backup-Repo '{name}' neu angelegt")
+
+
+def _gitlab_namespace_id_if_group(url: str, token: str, namespace: str):
+    headers = {"PRIVATE-TOKEN": token}
+    encoded_ns = urllib.parse.quote(namespace, safe="")
+    ns_r = http_get(f"{url}/api/v4/namespaces/{encoded_ns}", headers=headers, timeout=30,
+                    description="GitLab-Namespace ermitteln")
+    if ns_r.status_code == 200:
+        ns_data = ns_r.json()
+        if ns_data.get("kind") == "group":
+            return ns_data["id"]
+    return None
+
+
+def ensure_gitlab_target_repo(name: str) -> str:
+    """
+    Ziel 2 (GitLab-Account #1): Direkter Pfad-Lookup mit bereinigtem
+    Pfad. Gibt den tatsaechlich verwendeten Pfad zurueck.
+    """
+    safe_path = sanitize_gitlab_path(name)
+    headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+    project_path = f"{GITLAB_NAMESPACE}/{safe_path}"
+    encoded_path = urllib.parse.quote(project_path, safe="")
+    check_url = f"{GITLAB_URL}/api/v4/projects/{encoded_path}"
+
+    r = http_get(check_url, headers=headers, timeout=30,
+                 description=f"GitLab-#1-Projekt pruefen ({safe_path})")
+    if r.status_code == 200:
+        return safe_path
+    if r.status_code != 404:
+        raise RuntimeError(redact(f"Unklare Antwort HTTP {r.status_code} bei Pruefung "
+                                  f"von '{safe_path}': {r.text[:200]}"))
+
+    payload = {"name": name, "path": safe_path, "visibility": "private"}
+    ns_id = _gitlab_namespace_id_if_group(GITLAB_URL, GITLAB_TOKEN, GITLAB_NAMESPACE)
+    if ns_id:
+        payload["namespace_id"] = ns_id
+
+    r = http_post(f"{GITLAB_URL}/api/v4/projects", headers=headers, json_body=payload,
+                  timeout=30, description=f"GitLab-#1-Projekt anlegen ({safe_path})")
+    if r.status_code != 201:
+        raise RuntimeError(redact(f"GitLab-Projekt konnte nicht angelegt werden: {r.text}"))
+    if safe_path != name:
+        summary_log(f"  -> GitLab-Projekt '{safe_path}' neu angelegt (bereinigt aus '{name}')")
+    else:
+        summary_log(f"  -> GitLab-Projekt '{safe_path}' neu angelegt")
+    return safe_path
+
+
+def create_gitlab2_dated_project(dated_name: str) -> str:
+    """
+    Ziel 3 (GitLab-Account #2): Legt IMMER ein NEUES Projekt an.
+    Gibt den tatsaechlich verwendeten Pfad zurueck.
+    """
+    safe_path = sanitize_gitlab_path(dated_name)
+    headers = {"PRIVATE-TOKEN": GITLAB2_TOKEN}
+    payload = {"name": dated_name, "path": safe_path, "visibility": "private"}
+    ns_id = _gitlab_namespace_id_if_group(GITLAB2_URL, GITLAB2_TOKEN, GITLAB2_NAMESPACE)
+    if ns_id:
+        payload["namespace_id"] = ns_id
+
+    r = http_post(f"{GITLAB2_URL}/api/v4/projects", headers=headers, json_body=payload,
+                  timeout=30, description=f"GitLab-#2-Projekt anlegen ({safe_path})")
+    if r.status_code != 201:
+        raise RuntimeError(redact(f"GitLab-Account-#2-Projekt konnte nicht "
+                                  f"angelegt werden: {r.text}"))
+    summary_log(f"  -> GitLab-Account-#2: neues datiertes Projekt '{safe_path}' angelegt")
+    time.sleep(0.3)  # Rate-Limit-Schonung bei vielen Anlagen pro Lauf
+    return safe_path
+
+
+# ====================================================================
 #  FIX N: Default-Branch im GitHub-Ziel setzen
 # ====================================================================
+
 
 def sync_github_default_branch(backup_token: str, backup_owner: str,
                                name: str, source_default_branch: str):
@@ -375,7 +736,8 @@ def sync_github_default_branch(backup_token: str, backup_owner: str,
     """
     if not source_default_branch:
         return
-    headers = {"Authorization": f"token {backup_token}", "Accept": "application/vnd.github+json"}
+    headers = {"Authorization": f"token {backup_token}",
+               "Accept": "application/vnd.github+json"}
     r = http_patch(
         f"https://api.github.com/repos/{backup_owner}/{name}",
         headers=headers,
@@ -389,6 +751,7 @@ def sync_github_default_branch(backup_token: str, backup_owner: str,
 # ====================================================================
 #  FIX O: Plattenplatz-Waechter
 # ====================================================================
+
 
 def check_disk_space(workdir, repo_size_kb: int, repo_name: str) -> bool:
     """
@@ -406,7 +769,8 @@ def check_disk_space(workdir, repo_size_kb: int, repo_name: str) -> bool:
 
     if free_mb < needed_mb:
         summary_log(f"  !! ZU WENIG PLATTENPLATZ fuer {repo_name}: "
-                    f"{free_mb:.0f} MB frei, ca. {needed_mb:.0f} MB noetig - Repo wird UEBERSPRUNGEN")
+                    f"{free_mb:.0f} MB frei, ca. {needed_mb:.0f} MB noetig - "
+                    f"Repo wird UEBERSPRUNGEN")
         return False
 
     if free_mb < 2048:
@@ -415,12 +779,215 @@ def check_disk_space(workdir, repo_size_kb: int, repo_name: str) -> bool:
 
 
 # ====================================================================
-#  ANGEPASSTE process_repo() - so wird alles zusammengesteckt
+#  4) GOOGLE DRIVE Backup
+#  (ueberschreibt - alte Zip wird ERST NACH erfolgreichem Upload der
+#  neuen Zip geloescht, siehe FIX C. Suche zuverlaessig ueber
+#  corpora="drive"+driveId, siehe FIX D/E/F/G.)
 # ====================================================================
+
+_drive_service = None
+_drive_backup_folder_id = None
+_drive_shared_drive_id = None
+_drive_shared_drive_id_resolved = False
+
+
+def get_drive_service():
+    global _drive_service
+    if _drive_service is not None:
+        return _drive_service
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    info = json.loads(GDRIVE_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    _drive_service = build("drive", "v3", credentials=creds)
+    return _drive_service
+
+
+def get_shared_drive_id(service):
+    """
+    FIX D: Ermittelt EINMALIG die driveId des Shared Drives, in dem
+    GDRIVE_FOLDER_ID liegt. Liegt der Ordner in "Meine Ablage", gibt es
+    keine driveId - dann wird None zurueckgegeben und normal gesucht.
+    """
+    global _drive_shared_drive_id, _drive_shared_drive_id_resolved
+    if _drive_shared_drive_id_resolved:
+        return _drive_shared_drive_id
+
+    try:
+        info = with_retry(
+            lambda: service.files().get(
+                fileId=GDRIVE_FOLDER_ID, supportsAllDrives=True, fields="driveId",
+            ).execute(),
+            "Shared-Drive-ID ermitteln",
+        )
+        _drive_shared_drive_id = info.get("driveId")
+    except Exception as e:  # noqa: BLE001
+        summary_log(f"Hinweis: Shared-Drive-ID konnte nicht ermittelt werden ({e}) - "
+                    f"nutze Standard-Suche ohne corpora/driveId.")
+        _drive_shared_drive_id = None
+
+    _drive_shared_drive_id_resolved = True
+    if _drive_shared_drive_id:
+        summary_log("Shared-Drive erkannt (driveId ermittelt) - nutze zuverlaessige Suche.")
+    else:
+        summary_log("GDRIVE_FOLDER_ID liegt nicht in einem Shared Drive - Standard-Suche.")
+    return _drive_shared_drive_id
+
+
+def _drive_list_kwargs(service, query: str, fields: str):
+    """Baut die kwargs fuer files().list() - inkl. corpora/driveId (FIX D)."""
+    kwargs = dict(
+        q=query, fields=f"nextPageToken, {fields}",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+        pageSize=100,
+    )
+    drive_id = get_shared_drive_id(service)
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    return kwargs
+
+
+def list_all_drive_files(service, query: str, fields: str = "files(id, name, createdTime)"):
+    """
+    FIX E: Blaettert vollstaendig durch ALLE Ergebnis-Seiten, damit
+    auch mehrere bereits vorhandene Duplikate gefunden werden.
+    """
+    results = []
+    page_token = None
+    while True:
+        kwargs = _drive_list_kwargs(service, query, fields)
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = with_retry(
+            lambda kwargs=kwargs: service.files().list(**kwargs).execute(),
+            "Google-Drive-Suche",
+        )
+        results.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def delete_drive_file_if_exists(service, file_id: str, description: str):
+    """
+    FIX F: Ein 404 beim Loeschen bedeutet, dass die Datei bereits nicht
+    mehr existiert - das Ziel ist also schon erreicht. Kein Fehler,
+    kein Retry.
+    """
+    try:
+        service.files().delete(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception as e:  # noqa: BLE001
+        if "404" in str(e) or "notFound" in str(e) or "File not found" in str(e):
+            summary_log(f"     ({description}: Datei war bereits geloescht - ok)")
+            return
+        with_retry(
+            lambda: service.files().delete(fileId=file_id, supportsAllDrives=True).execute(),
+            description,
+        )
+
+
+def ensure_drive_backup_folder(service) -> str:
+    """
+    FIX G: Nimmt bei mehreren gleichnamigen Ordnern IMMER den
+    AELTESTEN - deterministisch statt zufaellig. Warnt zusaetzlich im
+    Log, falls Duplikate gefunden wurden.
+    """
+    global _drive_backup_folder_id
+    if _drive_backup_folder_id:
+        return _drive_backup_folder_id
+
+    query = (
+        f"name = '{GDRIVE_BACKUP_FOLDER_NAME}' and '{GDRIVE_FOLDER_ID}' in parents "
+        f"and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    existing = list_all_drive_files(service, query, fields="files(id, createdTime)")
+    existing.sort(key=lambda f: f.get("createdTime", ""))
+
+    if existing:
+        if len(existing) > 1:
+            summary_log(f"WARNUNG: {len(existing)} Ordner namens "
+                        f"'{GDRIVE_BACKUP_FOLDER_NAME}' gefunden - verwende den aeltesten. "
+                        f"Bitte manuell in Google Drive bereinigen.")
+        _drive_backup_folder_id = existing[0]["id"]
+        summary_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' gefunden.")
+        return _drive_backup_folder_id
+
+    folder = with_retry(
+        lambda: service.files().create(
+            body={
+                "name": GDRIVE_BACKUP_FOLDER_NAME,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [GDRIVE_FOLDER_ID],
+            },
+            fields="id",
+            supportsAllDrives=True,
+        ).execute(),
+        "Google-Drive-Backup-Ordner anlegen",
+    )
+    _drive_backup_folder_id = folder["id"]
+    summary_log(f"Google-Drive-Backup-Ordner '{GDRIVE_BACKUP_FOLDER_NAME}' neu angelegt.")
+    return _drive_backup_folder_id
+
+
+def backup_to_drive(bare_path: Path, repo_name: str):
+    """
+    Reihenfolge (FIX C): ERST wird die neue ZIP-Datei hochgeladen,
+    ERST DANACH (nur bei Erfolg) werden alte, gleichnamige Dateien
+    geloescht - so gibt es nie eine Luecke ohne Backup.
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    service = get_drive_service()
+    target_folder_id = ensure_drive_backup_folder(service)
+    zip_name = f"{repo_name}.git.zip"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = Path(tmp) / zip_name
+        summary_log("  -> packe fuer Google Drive")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file in bare_path.rglob("*"):
+                if file.is_file():
+                    zf.write(file, arcname=str(file.relative_to(bare_path.parent)))
+
+        # --- Schritt 1: alte Datei(en) suchen (noch nicht loeschen) ---
+        query = f"name = '{zip_name}' and '{target_folder_id}' in parents and trashed = false"
+        existing = list_all_drive_files(service, query, fields="files(id, createdTime)")
+        if len(existing) > 1:
+            summary_log(f"     ({len(existing)} alte Duplikate von '{zip_name}' "
+                        f"gefunden - werden bereinigt)")
+
+        # --- Schritt 2: NEUE Datei hochladen ---
+        summary_log("  -> lade zu Google Drive hoch")
+        media = MediaFileUpload(str(zip_path), mimetype="application/zip", resumable=True)
+        with_retry(
+            lambda: service.files().create(
+                body={"name": zip_name, "parents": [target_folder_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute(),
+            f"Drive-Upload ({repo_name})",
+        )
+
+        # --- Schritt 3: erst JETZT alle alten Datei(en) loeschen ---
+        for f in existing:
+            delete_drive_file_if_exists(service, f["id"],
+                                        f"alte Drive-Datei loeschen ({repo_name})")
+
+
+# ====================================================================
+#  HAUPTPROGRAMM
+# ====================================================================
+
 
 def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     """
-    Ersetzt die bisherige process_repo(). Wesentliche Aenderungen:
+    Wesentliche Aenderungen gegenueber der Erstfassung:
       - Plattenplatz wird VOR dem Klonen geprueft
       - LFS-Objekte werden mitgeholt
       - jeder Push ist atomar UND wird verifiziert
@@ -428,21 +995,11 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
       - overall_ok wird nur True, wenn die VERIFIKATION sauber war,
         nicht schon dann, wenn der Push-Befehl nicht gemeckert hat
     """
-    from backup import (
-        WORKDIR, SRC_GH_TOKEN,
-        BACKUP_GH_TOKEN, BACKUP_GH_OWNER,
-        GITLAB_TOKEN, GITLAB_NAMESPACE, GITLAB_URL,
-        GITLAB2_TOKEN, GITLAB2_NAMESPACE, GITLAB2_URL,
-        GDRIVE_SA_JSON, GDRIVE_FOLDER_ID,
-        mirror_clone_local, cleanup_local_mirror, backup_to_drive,
-        ensure_github_target_repo, ensure_gitlab_target_repo,
-        create_gitlab2_dated_project,
-    )
-
     name = repo["name"]
     default_branch = repo.get("default_branch") or ""
     size_kb = int(repo.get("size") or 0)
-    summary_log(f"--- {name} (Default-Branch: {default_branch or 'unbekannt'}, ca. {size_kb / 1024:.0f} MB) ---")
+    summary_log(f"--- {name} (Default-Branch: {default_branch or 'unbekannt'}, "
+                f"ca. {size_kb / 1024:.0f} MB) ---")
 
     if not check_disk_space(WORKDIR, size_kb, name):
         return False
@@ -487,14 +1044,16 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
             summary_log(f"  !! FEHLER (GitLab-Account-#1) bei {name}: {e}")
             overall_ok = False
 
-    # --- Ziel 3: GitLab-Account #2 (datiert) ---
+    # --- Ziel 3: GitLab-Account #2 (IMMER neues, datiertes Projekt) ---
     if GITLAB2_TOKEN and GITLAB2_NAMESPACE:
         try:
             dated_name = f"{name}_{run_timestamp_suffix}"
             safe_dated_path = create_gitlab2_dated_project(dated_name)
             host = GITLAB2_URL.replace("https://", "")
-            target = f"https://oauth2:{GITLAB2_TOKEN}@{host}/{GITLAB2_NAMESPACE}/{safe_dated_path}.git"
-            if not push_branches_and_tags(bare_path, target, "GitLab-Account-#2 (datiert)", name):
+            target = (f"https://oauth2:{GITLAB2_TOKEN}@{host}/"
+                      f"{GITLAB2_NAMESPACE}/{safe_dated_path}.git")
+            if not push_branches_and_tags(bare_path, target,
+                                          "GitLab-Account-#2 (datiert)", name):
                 overall_ok = False
         except Exception as e:  # noqa: BLE001
             summary_log(f"  !! FEHLER (GitLab-Account-#2) bei {name}: {e}")
@@ -515,3 +1074,58 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     else:
         summary_log(f"  UNVOLLSTAENDIG ({name}) - siehe Details oben")
     return overall_ok
+
+
+def main():
+    global _repo_total, _repo_index
+
+    start_time = datetime.now(timezone.utc)
+    run_timestamp_suffix = make_run_timestamp_suffix()
+    console_heartbeat("Backup gestartet.")
+    summary_log("===== Repo-Backup gestartet =====")
+    summary_log(f"Zeitstempel fuer GitLab-Account-#2 (UTC): {run_timestamp_suffix}")
+
+    ok, failed, failed_names = 0, 0, []
+
+    try:
+        repos = list_source_repos()
+        _repo_total = len(repos)
+        summary_log(f"{_repo_total} Quell-Repos gefunden.")
+
+        for i, repo in enumerate(repos, start=1):
+            _repo_index = i
+            console_heartbeat()
+            success = process_repo(repo, run_timestamp_suffix)
+            if success:
+                ok += 1
+            else:
+                failed += 1
+                failed_names.append(repo["name"])
+
+    except Exception as e:  # noqa: BLE001
+        summary_log(f"!! SCHWERWIEGENDER FEHLER, Lauf abgebrochen: {e}")
+        summary_log(redact(traceback.format_exc()))
+
+    duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+    summary_log(f"===== Fertig: {ok} ok, {failed} Fehler von {ok + failed} Repos. "
+                f"Dauer: {int(duration)}s =====")
+    console_heartbeat("Backup beendet.")
+
+    subject_status = "OK" if failed == 0 else f"{failed} FEHLER"
+    header = (
+        f"Backup-Zusammenfassung ({subject_status})\n"
+        f"Repos gesamt: {ok + failed} | vollstaendig verifiziert: {ok} | "
+        f"mit mind. 1 Problem: {failed}\n"
+        f"Dauer: {int(duration)} Sekunden\n"
+        f"GitLab-#2-Zeitstempel dieses Laufs (UTC): {run_timestamp_suffix}\n"
+    )
+    if failed_names:
+        header += "Repos mit mindestens einem Problem: " + ", ".join(failed_names) + "\n"
+    header += "\n----- Vollstaendiges Protokoll -----\n"
+
+    SUMMARY_FILE.write_text(header + "\n".join(SUMMARY_LINES) + "\n", encoding="utf-8")
+    sys.exit(1 if failed > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()
