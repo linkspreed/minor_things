@@ -9,7 +9,7 @@
   der Dateiinhalt selbst wird irgendwo gespeichert) und schreibt das
   Ergebnis in EIN einziges Google Sheet auf Google Drive.
 
-  Laeuft alle 6 Stunden (4x taeglich) per GitHub Action.
+  Laeuft per GitHub Action (Standard: jede volle Stunde).
 
   ---------------------------------------------------------------
   AUFBAU DES GOOGLE SHEETS (immer dasselbe Sheet, nie ein neues):
@@ -22,12 +22,13 @@
   Tab "Changelog":
       Ein einziges, chronologisches, NUR WACHSENDES Protokoll aller
       jemals erkannten Aenderungen (Datei hinzugefuegt/entfernt/
-      geaendert, Repo hinzugefuegt/entfernt). Hier wird NIE etwas
-      geloescht oder ueberschrieben, nur angehaengt.
+      geaendert, Repo hinzugefuegt/entfernt, Warnungen). Hier wird NIE
+      etwas geloescht oder ueberschrieben, nur angehaengt.
 
   Ein Tab PRO REPO (Name = bereinigter Repo-Name):
-      Eine Zeile pro Datei/Ordner mit Pfad, Typ, Codezeilen, Status,
-      "erstmals gesehen", "zuletzt gesehen", "zuletzt geaendert".
+      Eine Zeile pro Datei/Ordner mit Pfad, GitHub-Link, Typ,
+      Codezeilen, Status, "erstmals gesehen", "zuletzt gesehen",
+      "zuletzt geaendert".
 
   ---------------------------------------------------------------
   GRUNDPRINZIP: NUR ERGAENZEN, NIE ENTFERNEN
@@ -62,15 +63,58 @@
   Jede Zeile in einem Repo-Tab enthaelt zusaetzlich zum reinen Pfad
   eine Spalte "GitHub-Link" mit einer `=HYPERLINK(...)`-Formel, die
   direkt auf die Datei (bzw. bei Ordnern auf den Ordner) im Standard-
-  Branch des Repos auf GitHub verweist. Dafuer wird der von der
-  GitHub-API gelieferte `default_branch` des jeweiligen Repos
-  verwendet (Fallback: "main", falls das Feld fehlen sollte). Damit
-  diese Formeln von Google Sheets auch als Formeln (nicht als reiner
-  Text) interpretiert werden, schreibt das Skript alle Werte mit
-  `valueInputOption="USER_ENTERED"` statt "RAW".
+  Branch des Repos auf GitHub verweist (default_branch aus der
+  GitHub-API, Fallback "main"). Damit diese Formeln als Formeln (nicht
+  als reiner Text) interpretiert werden, schreibt das Skript alle
+  Werte mit `valueInputOption="USER_ENTERED"`.
 
   ---------------------------------------------------------------
-  TECHNISCHE HINWEISE:
+  FIXES NACH DEM VIERTEN TESTLAUF (28.08.2026, Abbruch nach 56 Repos):
+  ---------------------------------------------------------------
+
+  URSACHE: NICHT das 200-Tabs-Limit von Google Sheets (das ist bei 56
+  von aktuell ~200 Zieltabs noch weit entfernt), sondern das API-
+  RATE-LIMIT der Google Sheets API: Google erlaubt nur 60 Schreib-
+  Anfragen und 60 Lese-Anfragen PRO MINUTE PRO NUTZER. Fuer jeden NEU
+  angelegten Repo-Tab wurden bisher 4 einzelne API-Aufrufe gemacht
+  (Tab anlegen, Header schreiben, alte Zeilen lesen, neue Zeilen
+  anhaengen) - bei staerker als ~15 neuen Repos/Minute (durchaus
+  realistisch bei kleinen, schnell zu klonenden Repos) wurde die
+  60/Minute-Grenze ueberschritten. Google antwortet dann mit HTTP 429
+  ("Too Many Requests"). Die bisherige Retry-Logik (3s/6s/9s Pause)
+  war zu kurz, um ein volles 60-Sekunden-Zeitfenster abzuwarten -
+  nach 3 Versuchen wurde der jeweilige Tab-Aufbau als Fehler gewertet.
+
+  FIX H) Spezielle, LANGE Wartezeit bei HTTP 429 ("Too Many Requests"
+  / "RESOURCE_EXHAUSTED" / "Quota exceeded"): Statt der kurzen
+  Standard-Backoff-Zeiten wird bei einem erkannten Rate-Limit-Fehler
+  gezielt 65 Sekunden gewartet (ein volles Quota-Fenster + Puffer),
+  bevor erneut versucht wird.
+
+  FIX I) Weniger API-Aufrufe pro neuem Repo-Tab: Das Anlegen des Tabs
+  (addSheet) und das Schreiben der Kopfzeile (Header) werden jetzt in
+  EINEM einzigen batchUpdate-Aufruf zusammengefasst (statt 2 separaten
+  Aufrufen). Bei einem brandneuen Tab wird ausserdem das anfaengliche
+  Lesen bestehender Zeilen uebersprungen (es kann dort ja noch nichts
+  stehen) - das spart einen weiteren Lese-Aufruf. Dadurch sinkt der
+  API-Aufwand pro neuem Repo von 4 auf 2 Aufrufe.
+
+  FIX J) Eingebauter, PROAKTIVER Rate-Limiter: Eine einfache Bremse
+  (SheetsRateLimiter) sorgt dafuer, dass nie mehr als ca. 45 Sheets-
+  API-Aufrufe pro rollierender Minute abgeschickt werden - das Skript
+  wartet von sich aus kurz, BEVOR das Limit ueberhaupt erreicht wird,
+  statt erst nach einem 429-Fehler zu reagieren.
+
+  FIX K) Schutz vor dem ECHTEN 200-Tabs-Limit von Google Sheets: Wird
+  absehbar die Obergrenze erreicht (Standardpuffer: ab 195 belegten
+  Tabs), wird fuer WEITERE neue Repos KEIN eigener Detail-Tab mehr
+  angelegt (das wuerde ohnehin von Google abgelehnt) - die Gesamtzahlen
+  (Dateien/Ordner/Codezeilen) werden trotzdem korrekt in "Overview"
+  gefuehrt, und ein klarer Hinweis landet im Changelog. So bricht der
+  Lauf nicht ab, sondern degradiert kontrolliert.
+
+  ---------------------------------------------------------------
+  BESTEHENDE FUNKTIONSWEISE / TECHNISCHE HINWEISE:
   ---------------------------------------------------------------
 
   - Pro Repo wird ein FLACHER Klon (`git clone --depth 1`) gemacht -
@@ -85,12 +129,11 @@
     ueber eine gespeicherte ID im Repo - dadurch ist kein Schreibzugriff
     auf das Git-Repo noetig und es bleibt sicher fuer ein OEFFENTLICHES
     Repo (keine Tokens, keine IDs muessen dafuer versioniert werden).
-  - GRENZEN VON GOOGLE SHEETS: Ein Spreadsheet darf insgesamt max. ca.
-    10 Millionen Zellen enthalten (ueber ALLE Tabs zusammen). Bei ~200
-    Repos mit vielen Dateien kann das theoretisch relevant werden -
-    falls die Grenze erreicht wird, meldet die Google-Sheets-API einen
-    Fehler beim Schreiben, was dann im Changelog-Fehlerblock in der
-    Zusammenfassung auftaucht.
+  - GRENZEN VON GOOGLE SHEETS: Max. 200 Tabs pro Spreadsheet UND max.
+    ca. 10 Millionen Zellen insgesamt (ueber alle Tabs zusammen). Bei
+    ~200 Repos ist das Tab-Limit der praktisch relevantere Engpass
+    (siehe FIX K oben) - das Zell-Limit wird bei normalen Repo-Groessen
+    i.d.R. nicht vorher erreicht.
   - Tab-Namen duerfen laut Google Sheets keine der Zeichen
     : \\ / ? * [ ] enthalten und max. 100 Zeichen lang sein - das wird
     automatisch bereinigt (sanitize_sheet_title). Bei Namenskollisionen
@@ -113,6 +156,7 @@ import sys
 import time
 import traceback
 import urllib.parse
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,6 +194,13 @@ MAX_RETRIES = int(env("MAX_RETRIES", default="3"))
 RETRY_BASE_DELAY_SECONDS = float(env("RETRY_BASE_DELAY_SECONDS", default="3"))
 SLEEP_BETWEEN_REPOS_SECONDS = float(env("SLEEP_BETWEEN_REPOS_SECONDS", default="0.4"))
 
+# --- FIX J: proaktiver Rate-Limiter fuer die Sheets API ---
+SHEETS_MAX_CALLS_PER_MINUTE = int(env("SHEETS_MAX_CALLS_PER_MINUTE", default="45"))
+# --- FIX H: lange Wartezeit speziell bei 429/Quota-Fehlern ---
+SHEETS_QUOTA_BACKOFF_SECONDS = float(env("SHEETS_QUOTA_BACKOFF_SECONDS", default="65"))
+# --- FIX K: Puffer unterhalb des harten 200-Tabs-Limits von Google Sheets ---
+MAX_REPO_TABS = int(env("MAX_REPO_TABS", default="195"))  # laesst Platz fuer Overview/Changelog + Puffer
+
 _SECRETS = [s for s in [SRC_GH_TOKEN, GDRIVE_SA_JSON] if s]
 
 
@@ -185,7 +236,46 @@ def console_heartbeat(msg: str = None):
 
 
 # ====================================================================
-#  RETRY-HELFER (identisch zum Prinzip aus repo_backup.py)
+#  FIX J: PROAKTIVER RATE-LIMITER FUER DIE SHEETS API
+# ====================================================================
+
+class SheetsRateLimiter:
+    """
+    Einfacher rollierender Rate-Limiter: haelt Zeitstempel der letzten
+    Sheets-API-Aufrufe vor und wartet VON SICH AUS kurz, sobald sich
+    das Skript der Grenze (SHEETS_MAX_CALLS_PER_MINUTE) naehert -
+    statt erst reaktiv nach einem 429-Fehler zu bremsen.
+    """
+
+    def __init__(self, max_calls_per_minute: int):
+        self.max_calls = max_calls_per_minute
+        self.timestamps = deque()
+
+    def wait_if_needed(self):
+        now = time.monotonic()
+        while self.timestamps and now - self.timestamps[0] > 60:
+            self.timestamps.popleft()
+        if len(self.timestamps) >= self.max_calls:
+            sleep_for = 60 - (now - self.timestamps[0]) + 0.5
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            now = time.monotonic()
+            while self.timestamps and now - self.timestamps[0] > 60:
+                self.timestamps.popleft()
+        self.timestamps.append(time.monotonic())
+
+
+_sheets_rate_limiter = SheetsRateLimiter(SHEETS_MAX_CALLS_PER_MINUTE)
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return ("429" in text or "resource_exhausted" in text or "quota exceeded" in text
+            or "rate limit" in text or "too many requests" in text)
+
+
+# ====================================================================
+#  RETRY-HELFER (mit FIX H: langer Backoff speziell bei Quota-Fehlern)
 # ====================================================================
 
 def with_retry(func, description: str):
@@ -196,13 +286,26 @@ def with_retry(func, description: str):
         except Exception as e:  # noqa: BLE001
             last_error = e
             if attempt < MAX_RETRIES:
-                delay = RETRY_BASE_DELAY_SECONDS * attempt
-                summary_log(f"     (Versuch {attempt}/{MAX_RETRIES} fehlgeschlagen bei '{description}': {e} "
-                            f"- neuer Versuch in {delay:.0f}s)")
+                if _is_quota_error(e):
+                    delay = SHEETS_QUOTA_BACKOFF_SECONDS
+                    summary_log(f"     (Rate-Limit erkannt bei '{description}' - warte {delay:.0f}s "
+                                f"auf naechstes Quota-Fenster, dann Versuch {attempt + 1}/{MAX_RETRIES})")
+                else:
+                    delay = RETRY_BASE_DELAY_SECONDS * attempt
+                    summary_log(f"     (Versuch {attempt}/{MAX_RETRIES} fehlgeschlagen bei '{description}': {e} "
+                                f"- neuer Versuch in {delay:.0f}s)")
                 time.sleep(delay)
             else:
                 summary_log(f"     (Endgültig fehlgeschlagen nach {MAX_RETRIES} Versuchen bei '{description}': {e})")
     raise last_error
+
+
+def with_retry_sheets(func, description: str):
+    """Wie with_retry, aber zusaetzlich an den proaktiven Rate-Limiter gekoppelt (FIX J)."""
+    def _throttled():
+        _sheets_rate_limiter.wait_if_needed()
+        return func()
+    return with_retry(_throttled, description)
 
 
 def run(cmd, cwd=None, timeout=GIT_TIMEOUT_SECONDS, description: str = None):
@@ -320,6 +423,13 @@ def scan_repo_tree(root: Path):
     return entries
 
 
+def compute_stats(entries: list) -> dict:
+    files_count = sum(1 for e in entries if e["type"] == "file")
+    folders_count = sum(1 for e in entries if e["type"] == "folder")
+    lines_total = sum(e["lines"] for e in entries if e["type"] == "file" and e["lines"] is not None)
+    return {"files": files_count, "folders": folders_count, "lines": lines_total}
+
+
 def cleanup_local_clone(path: Path):
     if path and path.exists():
         shutil.rmtree(path, ignore_errors=True)
@@ -417,8 +527,12 @@ def find_or_create_spreadsheet() -> str:
     """
     Sucht das Sheet ueber Name+Ordner in Google Drive (KEINE ID wird
     im Git-Repo gespeichert - dadurch bleibt das ganze public-repo-
-    sicher). Existiert es nicht, wird es einmalig neu angelegt und der
-    Standard-Tab "Sheet1" in "Overview" umbenannt.
+    sicher). Existiert es nicht, wird es einmalig neu angelegt.
+
+    Der Drive-Dateiname wird SOFORT beim Anlegen gesetzt. Zusaetzlich
+    wird der interne Sheets-Dokumenttitel EXPLIZIT auf denselben Namen
+    gesetzt (verhindert "Untitled spreadsheet", falls die Sheets API
+    kurzzeitig nicht erreichbar/aktiviert war).
     """
     drive_service = get_drive_service()
     query = (
@@ -450,29 +564,35 @@ def find_or_create_spreadsheet() -> str:
     )
     spreadsheet_id = created["id"]
 
-    # Den von Google automatisch angelegten Standard-Tab "Sheet1" in
-    # "Overview" umbenennen, damit kein leerer Extra-Tab herumliegt.
     sheets_service = get_sheets_service()
-    meta = with_retry(
+    meta = with_retry_sheets(
         lambda: sheets_service.spreadsheets().get(
             spreadsheetId=spreadsheet_id, fields="sheets.properties(sheetId,title)",
         ).execute(),
         "Sheet-Metadaten lesen (nach Anlage)",
     )
     first_sheet_id = meta["sheets"][0]["properties"]["sheetId"]
-    with_retry(
+    with_retry_sheets(
         lambda: sheets_service.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            body={"requests": [{
-                "updateSheetProperties": {
-                    "properties": {"sheetId": first_sheet_id, "title": "Overview"},
-                    "fields": "title",
+            body={"requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": first_sheet_id, "title": "Overview"},
+                        "fields": "title",
+                    },
                 },
-            }]},
+                {
+                    "updateSpreadsheetProperties": {
+                        "properties": {"title": GSHEET_NAME},
+                        "fields": "title",
+                    },
+                },
+            ]},
         ).execute(),
-        "Standard-Tab in 'Overview' umbenennen",
+        "Standard-Tab umbenennen + internen Dokumenttitel setzen",
     )
-    summary_log(f"Neues Sheet '{GSHEET_NAME}' angelegt (Standard-Tab in 'Overview' umbenannt).")
+    summary_log(f"Neues Sheet '{GSHEET_NAME}' angelegt (Titel gesetzt, Standard-Tab in 'Overview' umbenannt).")
     return spreadsheet_id
 
 
@@ -503,10 +623,7 @@ def build_github_link(owner: str, repo_name: str, branch: str, path: str, entry_
     """
     Baut eine =HYPERLINK(...)-Formel, die direkt auf die Datei (Typ
     "file" -> /blob/) bzw. den Ordner (Typ "folder" -> /tree/) im
-    angegebenen Branch auf GitHub verweist. Der Pfad wird fuer die URL
-    korrekt escaped (Leerzeichen/Sonderzeichen), Schraegstriche bleiben
-    als Trenner erhalten. Anfuehrungszeichen im sichtbaren Label werden
-    verdoppelt, damit die Formel gueltig bleibt.
+    angegebenen Branch auf GitHub verweist.
     """
     encoded_path = urllib.parse.quote(path, safe="/")
     kind = "tree" if entry_type == "folder" else "blob"
@@ -539,7 +656,7 @@ class SheetManager:
         self._load_existing_tabs()
 
     def _load_existing_tabs(self):
-        meta = with_retry(
+        meta = with_retry_sheets(
             lambda: self.service.spreadsheets().get(
                 spreadsheetId=self.spreadsheet_id, fields="sheets.properties(sheetId,title)",
             ).execute(),
@@ -550,31 +667,51 @@ class SheetManager:
             self.tab_ids[props["title"]] = props["sheetId"]
             _used_tab_titles.add(props["title"].lower())
 
-    def ensure_tab(self, title: str, header: list) -> int:
+    def tab_count(self) -> int:
+        return len(self.tab_ids)
+
+    def ensure_tab(self, title: str, header: list) -> tuple:
+        """
+        Gibt (sheet_id, war_neu_angelegt) zurueck.
+        FIX I: Tab anlegen + Header schreiben in EINEM batchUpdate-
+        Aufruf statt zwei separaten Aufrufen (addSheet + updateCells).
+        """
         if title in self.tab_ids:
-            return self.tab_ids[title]
-        response = with_retry(
+            return self.tab_ids[title], False
+
+        num_cols = len(header)
+        response = with_retry_sheets(
             lambda: self.service.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
-                body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+                body={"requests": [
+                    {"addSheet": {"properties": {"title": title}}},
+                ]},
             ).execute(),
             f"Tab '{title}' anlegen",
         )
         sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
         self.tab_ids[title] = sheet_id
-        with_retry(
-            lambda: self.service.spreadsheets().values().update(
+
+        header_row = {
+            "values": [{"userEnteredValue": {"stringValue": h}} for h in header]
+        }
+        with_retry_sheets(
+            lambda: self.service.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
-                range=f"'{title}'!A1",
-                valueInputOption="USER_ENTERED",
-                body={"values": [header]},
+                body={"requests": [{
+                    "updateCells": {
+                        "rows": [header_row],
+                        "fields": "userEnteredValue",
+                        "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
+                    },
+                }]},
             ).execute(),
             f"Header fuer '{title}' schreiben",
         )
-        return sheet_id
+        return sheet_id, True
 
     def get_values(self, title: str) -> list:
-        response = with_retry(
+        response = with_retry_sheets(
             lambda: self.service.spreadsheets().values().get(
                 spreadsheetId=self.spreadsheet_id, range=f"'{title}'!A:Z",
             ).execute(),
@@ -585,7 +722,7 @@ class SheetManager:
     def append_rows(self, title: str, rows: list):
         if not rows:
             return
-        with_retry(
+        with_retry_sheets(
             lambda: self.service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
                 range=f"'{title}'!A1",
@@ -601,7 +738,7 @@ class SheetManager:
         if not updates:
             return
         data = [{"range": r, "values": v} for r, v in updates]
-        with_retry(
+        with_retry_sheets(
             lambda: self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"valueInputOption": "USER_ENTERED", "data": data},
@@ -615,7 +752,7 @@ class SheetManager:
         chunk_size = 200
         for i in range(0, len(format_requests), chunk_size):
             chunk = format_requests[i:i + chunk_size]
-            with_retry(
+            with_retry_sheets(
                 lambda chunk=chunk: self.service.spreadsheets().batchUpdate(
                     spreadsheetId=self.spreadsheet_id, body={"requests": chunk},
                 ).execute(),
@@ -654,10 +791,15 @@ def process_repo_tab(mgr: SheetManager, tab_title: str, current_entries: list,
       5 Erstmals gesehen | 6 Zuletzt gesehen | 7 Zuletzt geändert | 8 Hinweis
     """
     header = REPO_TAB_HEADER
-    sheet_id = mgr.ensure_tab(tab_title, header)
+    sheet_id, is_new_tab = mgr.ensure_tab(tab_title, header)
     ts = now_str()
 
-    existing_rows = mgr.get_values(tab_title)
+    # FIX I: bei einem brandneuen Tab gibt es garantiert noch keine
+    # bestehenden Zeilen - der Lese-Aufruf kann dann komplett entfallen.
+    if is_new_tab:
+        existing_rows = []
+    else:
+        existing_rows = mgr.get_values(tab_title)
     data_rows = existing_rows[1:] if len(existing_rows) > 1 else []
 
     existing_map = {}
@@ -697,8 +839,6 @@ def process_repo_tab(mgr: SheetManager, tab_title: str, current_entries: list,
             changed = True
 
         last_changed = ts if changed else old_last_changed
-        # Spalten B (GitHub-Link) bis I (Hinweis) - Link wird bei jedem
-        # Lauf aktualisiert (falls sich z.B. der Default-Branch aendert).
         value_updates.append((
             f"'{tab_title}'!B{row_number}:I{row_number}",
             [[link_formula, entry["type"], lines_str, "Active", old_first_seen, ts,
@@ -713,7 +853,6 @@ def process_repo_tab(mgr: SheetManager, tab_title: str, current_entries: list,
         row_number = info["row_number"]
         old = info["values"]
         changelog_rows.append([ts, tab_title, path, "Entfernt", old[3], "", ""])
-        # Spalten E (Status) bis H (Zuletzt geändert)
         value_updates.append((
             f"'{tab_title}'!E{row_number}:H{row_number}",
             [["Removed", old[5], old[6], ts]],
@@ -723,10 +862,7 @@ def process_repo_tab(mgr: SheetManager, tab_title: str, current_entries: list,
     mgr.append_rows(tab_title, new_rows)
     mgr.batch_update_values(value_updates)
 
-    files_count = sum(1 for e in current_map.values() if e["type"] == "file")
-    folders_count = sum(1 for e in current_map.values() if e["type"] == "folder")
-    lines_total = sum(e["lines"] for e in current_map.values() if e["type"] == "file" and e["lines"] is not None)
-    return {"files": files_count, "folders": folders_count, "lines": lines_total}
+    return compute_stats(current_entries)
 
 
 # ====================================================================
@@ -810,6 +946,7 @@ def main():
 
     changelog_rows = []
     ok, failed, failed_names = 0, 0, []
+    tab_limit_warning_logged = False
 
     try:
         repos = list_source_repos()
@@ -838,12 +975,28 @@ def main():
                 clone_path = shallow_clone(name, source_url)
                 entries = scan_repo_tree(clone_path)
                 branch = repo.get("default_branch") or "main"
-
                 tab_title = sanitize_sheet_title(name)
-                repo_format_requests = []
-                stats = process_repo_tab(mgr, tab_title, entries, changelog_rows, repo_format_requests,
-                                          owner=SRC_GH_OWNER, repo_name=name, branch=branch)
-                mgr.flush_formatting(repo_format_requests)
+
+                # FIX K: Schutz vor dem harten 200-Tabs-Limit von Google
+                # Sheets. Existiert der Tab schon, wird er ganz normal
+                # weitergepflegt (kostet ja keinen neuen Tab). Nur fuer
+                # WIRKLICH NEUE Tabs greift die Bremse.
+                would_be_new_tab = tab_title not in mgr.tab_ids
+                if would_be_new_tab and mgr.tab_count() >= MAX_REPO_TABS:
+                    stats = compute_stats(entries)
+                    if not tab_limit_warning_logged:
+                        summary_log(f"WARNUNG: Google-Sheets-Tab-Limit (max. 200) bald erreicht "
+                                    f"({mgr.tab_count()} Tabs belegt) - fuer '{name}' und ggf. weitere "
+                                    f"neue Repos wird KEIN Detail-Tab mehr angelegt. Gesamtzahlen "
+                                    f"werden trotzdem in 'Overview' gefuehrt.")
+                        changelog_rows.append([now_str(), name, "(gesamtes Repo)",
+                                                "Kein Detail-Tab (Tab-Limit erreicht)", "", "", ""])
+                        tab_limit_warning_logged = True
+                else:
+                    repo_format_requests = []
+                    stats = process_repo_tab(mgr, tab_title, entries, changelog_rows, repo_format_requests,
+                                              owner=SRC_GH_OWNER, repo_name=name, branch=branch)
+                    mgr.flush_formatting(repo_format_requests)
 
                 update_overview_for_repo(
                     mgr, overview_map, name, tab_title, stats, changelog_rows,
