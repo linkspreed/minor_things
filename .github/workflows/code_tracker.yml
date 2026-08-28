@@ -1,0 +1,107 @@
+name: Repo Code-Tracker
+
+on:
+  schedule:
+    # Alle 6 Stunden, aber bewusst 3h VERSETZT zum Repo-Super-Backup
+    # (dieses laeuft 0/6/12/18 UTC), damit sich beide Actions nicht
+    # gegenseitig Rechenzeit/Netzwerk auf demselben Runner wegnehmen:
+    - cron: '0 3,9,15,21 * * *'
+  workflow_dispatch: {}     # erlaubt manuelles Starten über den "Run workflow"-Button
+
+# Verhindert, dass zwei Laeufe DIESES Workflows gleichzeitig laufen.
+# Eigene Gruppe (nicht dieselbe wie beim Backup-Workflow), damit sich
+# Backup und Code-Tracker gegenseitig nicht blockieren.
+concurrency:
+  group: repo-code-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install requests google-api-python-client google-auth
+
+      - name: Code-Tracking ausführen
+        id: run_tracker
+        continue-on-error: true   # WICHTIG: Ein Fehler hier darf die Benachrichtigung unten nicht verhindern
+        env:
+          # --- Quelle: derselbe GitHub-Account wie beim Backup ---
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          # --- Google Drive/Sheets (dieselbe Ablage wie beim Backup) ---
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GSHEET_NAME: ${{ vars.GSHEET_NAME }}   # optional, Default: "Repo_Code_Tracking"
+          # --- Allgemeine Einstellungen ---
+          QUIET_CONSOLE: "true"
+          EMAIL_SUMMARY_FILE: "code_tracker_summary.txt"
+          MAX_RETRIES: "3"
+          RETRY_BASE_DELAY_SECONDS: "3"
+          SLEEP_BETWEEN_REPOS_SECONDS: "0.4"
+        run: python repo_code_tracker.py
+
+      # Benachrichtigung über Google Chat - läuft IMMER (if: always()),
+      # egal ob der Tracker-Schritt oben erfolgreich war oder nicht.
+      # Nutzt denselben Webhook wie der Backup-Workflow. Ist das Secret
+      # nicht gesetzt, wird die Benachrichtigung einfach übersprungen.
+      - name: Ergebnis an Google Chat senden
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRACKER_OUTCOME: ${{ steps.run_tracker.outcome }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import urllib.request
+
+          webhook_url = os.environ.get("WEBHOOK_URL")
+          if not webhook_url:
+              print("Kein GOOGLE_CHAT_WEBHOOK gesetzt - Benachrichtigung übersprungen.")
+              raise SystemExit(0)
+
+          outcome = os.environ.get("TRACKER_OUTCOME", "unknown")
+          run_url = os.environ.get("RUN_URL", "")
+          icon = "✅" if outcome == "success" else "❌"
+
+          try:
+              with open("code_tracker_summary.txt", "r", encoding="utf-8") as f:
+                  content = f.read()
+          except FileNotFoundError:
+              content = "Keine Zusammenfassung gefunden."
+
+          max_len = 3500
+          if len(content) > max_len:
+              content = "...(gekuerzt)...\n" + content[-max_len:]
+
+          text = f"{icon} Repo-Code-Tracker Ergebnis\n\n{content}\n\nDetails: {run_url}"
+          payload = json.dumps({"text": text}).encode("utf-8")
+
+          req = urllib.request.Request(
+              webhook_url, data=payload,
+              headers={"Content-Type": "application/json; charset=UTF-8"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Google Chat Antwort: HTTP {resp.status}")
+          except Exception as e:
+              print(f"Fehler beim Senden an Google Chat: {e}")
+          PYEOF
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_tracker.outcome != 'success'
+        run: exit 1
