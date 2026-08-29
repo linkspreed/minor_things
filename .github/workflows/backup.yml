@@ -63,6 +63,11 @@ jobs:
           EMAIL_SUMMARY_FILE: "email_summary.txt"
           MAX_RETRIES: "3"
           RETRY_BASE_DELAY_SECONDS: "3"
+          # --- Performance-Fix (28.08.2026): bestätigt kein Repo nutzt
+          # Git-LFS -> LFS-Schritt (teurer History-Scan) komplett
+          # überspringen. Bei zukünftigem LFS-Einsatz auf "auto" (nur
+          # günstige .gitattributes-Prüfung) oder "always" umstellen.
+          GIT_LFS_MODE: "never"
         run: python backup_repos.py
 
       # Benachrichtigung über Google Chat - läuft IMMER (if: always()),
