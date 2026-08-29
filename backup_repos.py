@@ -63,6 +63,12 @@
     Quelle hat. verify_refs() vergleicht Ref-Name UND Commit-SHA
     zwischen lokalem Mirror und Ziel (via git ls-remote) und meldet
     fehlende bzw. abweichende Refs NAMENTLICH.
+    WICHTIG (Klarstellung nach Performance-Analyse, siehe FIX P/Q
+    unten): Diese Pruefung listet NUR Referenzen auf (git for-each-ref
+    / git ls-remote), sie liest NICHT die Commit-Historie dahinter.
+    Die Laufzeit skaliert mit der ANZAHL DER BRANCHES/TAGS, nicht mit
+    der Anzahl der Commits - bei Repos mit hunderttausenden Commits
+    aber wenigen Branches ist dieser Schritt weiterhin sehr guenstig.
 
   FIX J) RATE-LIMITS (429 / 403 secondary) WERDEN WIEDERHOLT
     Bisher wurde nur bei HTTP >= 500 wiederholt. Eine gedrosselte
@@ -77,10 +83,16 @@
 
   FIX L) GIT-LFS-OBJEKTE
     `git clone --mirror` kopiert nur LFS-Pointer, nicht die Inhalte.
+    (Siehe FIX P unten: dieser Schritt wurde nachtraeglich als
+    Hauptursache fuer extrem lange Laufzeiten bei Repos mit sehr
+    vielen Commits identifiziert und entsprechend entschaerft.)
 
   FIX M) ROBUSTERE GIT-UEBERTRAGUNG GROSSER REPOS
-    postBuffer hoch, Kompression runter - beugt "RPC failed" und
-    "early EOF" bei grossen Pushes vor.
+    postBuffer hoch - beugt "RPC failed" und "early EOF" bei grossen
+    Pushes vor.
+    (Siehe FIX Q unten: die urspruenglich HIER zusaetzlich gesetzten
+    Kompressions-/Thread-Werte wurden nachtraeglich als zweite
+    Hauptursache fuer die Verlangsamung erkannt und zurueckgenommen.)
 
   FIX N) DEFAULT-BRANCH IM ZIEL SETZEN
     Neu angelegte GitHub-Repos haben HEAD auf 'main'. Heisst der
@@ -89,6 +101,66 @@
   FIX O) PLATTENPLATZ-WAECHTER
     Mirror + ZIP liegen gleichzeitig auf derselben Disk (~2x
     Repogroesse). Laeuft sie voll, fehlt das Repo in ALLEN Zielen.
+
+  ---------------------------------------------------------------
+  FIXES P-S (Performance-Ursachenbefund, 28.08.2026: "nur ein paar
+  wenige Repos mit hunderttausenden Commits sind extrem langsam,
+  obwohl sich die Push-Befehle nicht geaendert haben. Bestaetigt:
+  KEIN Repo im Account nutzt Git-LFS.")
+  ---------------------------------------------------------------
+
+  BEFUND: Die Push-Befehle selbst sind tatsaechlich unveraendert.
+  Die Verifikation (FIX I) skaliert nur mit der Ref-Anzahl, nicht mit
+  der Commit-Anzahl - sie war NICHT die Ursache. Die tatsaechlichen
+  Ursachen waren zwei Aenderungen aus FIX L und FIX M:
+
+  FIX P) GIT-LFS-SCHRITT KOMPLETT DEAKTIVIERBAR (Standard hier: "never")
+    `git lfs fetch --all` / `git lfs push --all` muessen, um ALLE
+    jemals referenzierten LFS-Pointer zu finden, den KOMPLETTEN
+    Commit-Verlauf JEDES Branches durchwandern - das skaliert direkt
+    mit der Anzahl der Commits (dokumentiertes Git-LFS-Verhalten).
+    Das wurde bisher fuer JEDES Repo versucht, unabhaengig davon, ob
+    LFS ueberhaupt genutzt wird. Bei Repos mit hunderttausenden
+    Commits war GENAU DIESER Schritt der mit Abstand teuerste - auch
+    wenn am Ende "kein LFS gefunden" herauskam, musste dafuer schon
+    die komplette Historie durchwandert werden.
+    Da bestaetigt ist, dass AKTUELL KEIN Repo im Account LFS nutzt,
+    ist GIT_LFS_MODE in backup.yml auf "never" gesetzt - der gesamte
+    LFS-Schritt (inkl. der guenstigen .gitattributes-Vorpruefung)
+    wird dadurch komplett uebersprungen. Ueber GIT_LFS_MODE=auto
+    (Heuristik: nur .gitattributes an der Branch-Spitze pruefen,
+    OHNE Historien-Scan) oder GIT_LFS_MODE=always (immer vollen,
+    langsamen Scan erzwingen) weiterhin einstellbar, falls sich das
+    in Zukunft aendert.
+
+  FIX Q) KOMPRESSIONS-/THREAD-REGRESSION AUS FIX M ZURUECKGENOMMEN
+    FIX M hatte zusaetzlich `pack.threads=1` (nur EIN CPU-Kern fuer
+    die Objekt-Kompression) und `core.compression=1` (sehr NIEDRIGE
+    Kompression, dadurch deutlich mehr Rohdaten) gesetzt - gedacht als
+    RAM-Schutz. Das traf besonders hart auf ZIEL 3 (GitLab-Account #2,
+    das JEDEN Lauf ein brandneues, leeres Projekt anlegt): dort kann
+    Git KEINE vorhandenen Objekte wiederverwenden und muss bei jedem
+    Lauf die KOMPLETTE Historie neu uebertragen - bei hunderttausenden
+    Commits und schlechter Kompression potenziell ein Vielfaches an
+    zu uebertragenden Rohdaten, dazu nur einfach-thread-gepackt.
+    LOESUNG: Diese beiden Einstellungen werden nicht mehr hart
+    erzwungen - Git entscheidet wieder selbst (nutzt automatisch
+    mehrere CPU-Kerne, balancierte Standard-Kompression). Ueber
+    GIT_PACK_THREADS / GIT_COMPRESSION_LEVEL weiterhin gezielt
+    einstellbar, falls doch mal noetig.
+
+  FIX R) LAUFZEIT-MESSUNG PRO SCHRITT
+    Klonen, LFS-Schritt (falls aktiv), jeder einzelne Push, jede
+    Verifikation und der Drive-Upload werden jetzt einzeln zeit-
+    gestempelt und im Protokoll ausgewiesen - dadurch ist bei
+    kuenftig auffaellig langsamen Repos SOFORT ersichtlich, welcher
+    konkrete Schritt die Zeit kostet, statt erneut raten zu muessen.
+
+  FIX S) REFERENZEN NUR EINMAL PRO REPO BERECHNET
+    local_refs() wurde bisher bis zu 4x pro Repo neu per Git-Befehl
+    abgefragt (einmal fuer die Log-Ausgabe, dann erneut in JEDER
+    Verifikation). Wird jetzt einmal berechnet und an alle Stellen
+    weitergereicht - kleine, saubere Zusatz-Optimierung.
 
   ---------------------------------------------------------------
   BESTEHENDE FUNKTIONSWEISE
@@ -120,6 +192,7 @@
 ====================================================================
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -191,6 +264,12 @@ QUIET_CONSOLE = env("QUIET_CONSOLE", default="true").lower() == "true"
 MAX_RETRIES = int(env("MAX_RETRIES", default="3"))
 RETRY_BASE_DELAY_SECONDS = float(env("RETRY_BASE_DELAY_SECONDS", default="3"))
 
+# --- FIX P: LFS-Modus ("never" = Schritt komplett ueberspringen -
+#     Standard, da bestaetigt kein Repo LFS nutzt; "auto" = guenstige
+#     .gitattributes-Heuristik OHNE Historien-Scan; "always" = immer
+#     vollen, langsamen Scan erzwingen)
+GIT_LFS_MODE = env("GIT_LFS_MODE", default="never").lower()
+
 _SECRETS = [s for s in [
     SRC_GH_TOKEN, BACKUP_GH_TOKEN, GITLAB_TOKEN, GITLAB2_TOKEN, GDRIVE_SA_JSON,
 ] if s]
@@ -225,6 +304,20 @@ def console_heartbeat(msg: str = None):
             print(f"... Verarbeite Repo {_repo_index}/{_repo_total} ...", flush=True)
     else:
         print(msg or f"Repo {_repo_index}/{_repo_total}", flush=True)
+
+
+# ====================================================================
+#  FIX R: Laufzeit-Messung pro Schritt
+# ====================================================================
+
+@contextlib.contextmanager
+def timed(label: str):
+    """Misst die Dauer eines Schrittes und schreibt sie ins Protokoll."""
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        summary_log(f"     (Dauer {label}: {time.monotonic() - start:.1f}s)")
 
 
 # ====================================================================
@@ -263,6 +356,26 @@ def run(cmd, cwd=None, timeout=GIT_TIMEOUT_SECONDS, description: str = None):
             raise RuntimeError(f"Timeout nach {timeout}s bei einem Git-Befehl.")
 
     return with_retry(_attempt, description or " ".join(cmd[:2]))
+
+
+def run_quiet_no_retry(cmd, timeout=30):
+    """
+    Fuer guenstige Existenz-/Inhaltschecks, bei denen ein Fehlschlag
+    (z.B. "Datei existiert nicht auf diesem Branch") ein VOELLIG
+    NORMALES, haeufiges Ergebnis ist - NICHT ueber with_retry laufen
+    lassen, sonst wuerden ganz normale Nicht-Treffer 3x mit Wartezeit
+    wiederholt und kosten unnoetig viel Zeit (siehe FIX P).
+    Gibt bei Erfolg stdout zurueck, sonst None.
+    """
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout
+    except subprocess.TimeoutExpired:
+        return None
 
 
 # ====================================================================
@@ -410,16 +523,26 @@ def sanitize_gitlab_path(name: str) -> str:
 
 
 # ====================================================================
-#  FIX M: Git-Optionen fuer grosse Repos
+#  FIX M (urspruenglich) + FIX Q (Korrektur): Git-Optionen fuer grosse
+#  Repos. postBuffer/lowSpeedLimit/lowSpeedTime bleiben als legitime
+#  Zuverlaessigkeits-Einstellungen bestehen. pack.threads/core.compression
+#  werden NICHT MEHR hart erzwungen (siehe FIX Q oben im Docstring) -
+#  Git nutzt wieder seine eigenen, sinnvollen Standardwerte (automatische
+#  Thread-Anzahl je nach CPU, balancierte Standard-Kompression). Nur bei
+#  explizit gesetzter Umgebungsvariable wird ein Wert erzwungen.
 # ====================================================================
 
 GIT_BIG_REPO_OPTS = [
     "-c", "http.postBuffer=524288000",      # 500 MB statt 1 MB Default
     "-c", "http.lowSpeedLimit=1000",        # Abbruch erst bei echtem Stillstand
     "-c", "http.lowSpeedTime=300",
-    "-c", "pack.threads=1",                 # weniger RAM-Spitzen auf dem Runner
-    "-c", "core.compression=1",             # schneller, weniger CPU-Timeout-Risiko
 ]
+_pack_threads_override = env("GIT_PACK_THREADS", default="")
+if _pack_threads_override:
+    GIT_BIG_REPO_OPTS += ["-c", f"pack.threads={_pack_threads_override}"]
+_compression_override = env("GIT_COMPRESSION_LEVEL", default="")
+if _compression_override:
+    GIT_BIG_REPO_OPTS += ["-c", f"core.compression={_compression_override}"]
 
 
 # ====================================================================
@@ -473,7 +596,7 @@ def cleanup_local_mirror(bare_path: Path):
 
 
 # ====================================================================
-#  FIX H + I: atomarer Push MIT Verifikation
+#  FIX H + I + S: atomarer Push MIT Verifikation (Refs wiederverwendet)
 # ====================================================================
 
 
@@ -511,15 +634,19 @@ def remote_refs(target_url_with_token: str, label: str) -> dict:
     return refs
 
 
-def verify_refs(bare_path, target_url_with_token: str, label: str, repo_name: str) -> bool:
+def verify_refs(bare_path, target_url_with_token: str, label: str, repo_name: str,
+                src_refs: dict = None) -> bool:
     """
     FIX I - der entscheidende Baustein.
 
     Vergleicht Quelle und Ziel Ref fuer Ref. Meldet FEHLENDE und
     ABWEICHENDE Refs namentlich in die Zusammenfassung. Ohne diese
     Pruefung bleibt ein unvollstaendiges Backup unsichtbar.
+
+    FIX S: src_refs kann vorberechnet uebergeben werden, um den
+    Git-Befehl nicht pro Push-Ziel erneut auszufuehren.
     """
-    src = local_refs(bare_path)
+    src = src_refs if src_refs is not None else local_refs(bare_path)
     dst = remote_refs(target_url_with_token, label)
 
     missing = sorted(set(src) - set(dst))
@@ -542,7 +669,8 @@ def verify_refs(bare_path, target_url_with_token: str, label: str, repo_name: st
 
 
 def push_branches_and_tags(bare_path, target_url_with_token: str,
-                           label: str, repo_name: str = "") -> bool:
+                           label: str, repo_name: str = "",
+                           src_refs: dict = None) -> bool:
     """
     FIX A: Statt `git push --mirror` werden gezielt nur Branches und
     Tags gepusht - das umgeht GitHubs interne PR-Referenzen.
@@ -555,50 +683,92 @@ def push_branches_and_tags(bare_path, target_url_with_token: str,
     "Everything up-to-date" meldete. Genau dieser Fall hat bisher
     unvollstaendige Ziele als in Ordnung durchgewunken.
 
+    FIX R: Push und Verifikation werden separat zeitgestempelt.
+
     Rueckgabewert: True nur, wenn Push UND Verifikation sauber sind.
     """
     summary_log(f"  -> spiegle nach {label}")
     push_ok = True
 
-    try:
-        run(
-            ["git"] + GIT_BIG_REPO_OPTS + [
-                "--git-dir", str(bare_path), "push", "--atomic", "--prune",
-                target_url_with_token,
-                "+refs/heads/*:refs/heads/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-            description=f"push (atomar, heads+tags) nach {label}",
-        )
-    except RuntimeError as e:
-        text = str(e).lower()
-        if "up-to-date" in text:
-            summary_log(f"     ({label}: bereits aktuell)")
-        else:
-            summary_log(f"  !! PUSH-FEHLER {label} bei {repo_name}: {e}")
-            push_ok = False
+    with timed(f"Push {label}"):
+        try:
+            run(
+                ["git"] + GIT_BIG_REPO_OPTS + [
+                    "--git-dir", str(bare_path), "push", "--atomic", "--prune",
+                    target_url_with_token,
+                    "+refs/heads/*:refs/heads/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+                description=f"push (atomar, heads+tags) nach {label}",
+            )
+        except RuntimeError as e:
+            text = str(e).lower()
+            if "up-to-date" in text:
+                summary_log(f"     ({label}: bereits aktuell)")
+            else:
+                summary_log(f"  !! PUSH-FEHLER {label} bei {repo_name}: {e}")
+                push_ok = False
 
     # Verifikation laeuft IMMER - auch nach fehlgeschlagenem Push,
     # damit im Protokoll steht, was tatsaechlich im Ziel liegt.
-    try:
-        verify_ok = verify_refs(bare_path, target_url_with_token, label, repo_name)
-    except Exception as e:  # noqa: BLE001
-        summary_log(f"  !! VERIFIKATION {label} bei {repo_name} nicht moeglich: {e}")
-        verify_ok = False
+    with timed(f"Verifikation {label}"):
+        try:
+            verify_ok = verify_refs(bare_path, target_url_with_token, label, repo_name,
+                                    src_refs=src_refs)
+        except Exception as e:  # noqa: BLE001
+            summary_log(f"  !! VERIFIKATION {label} bei {repo_name} nicht moeglich: {e}")
+            verify_ok = False
 
     return push_ok and verify_ok
 
 
 # ====================================================================
-#  FIX L: Git-LFS-Objekte mitsichern
+#  FIX P: Git-LFS nur bei tatsaechlichem Bedarf (Standard: komplett aus)
 # ====================================================================
+
+
+def repo_uses_lfs(bare_path: Path) -> bool:
+    """
+    Siehe FIX P im Modul-Docstring. GIT_LFS_MODE="never" (Standard,
+    da bestaetigt kein Repo im Account LFS nutzt) gibt sofort False
+    zurueck, OHNE ueberhaupt einen Branch anzuschauen - dadurch entfaellt
+    auch die guenstige .gitattributes-Pruefung komplett.
+    GIT_LFS_MODE="auto" prueft NUR die .gitattributes-Datei an der
+    SPITZE jedes Branches (nicht die volle Historie) auf "filter=lfs".
+    Absichtlich OHNE with_retry, da "Datei existiert auf diesem Branch
+    nicht" ein voellig normales, haeufiges Ergebnis ist, kein Fehler.
+    """
+    if GIT_LFS_MODE == "never":
+        return False
+    if GIT_LFS_MODE == "always":
+        return True
+
+    try:
+        branches_out = run(
+            ["git", "--git-dir", str(bare_path), "for-each-ref",
+             "--format=%(refname)", "refs/heads/"],
+            description="Branch-Liste fuer LFS-Check",
+        )
+    except RuntimeError:
+        return False
+
+    for branch_ref in branches_out.splitlines():
+        branch_ref = branch_ref.strip()
+        if not branch_ref:
+            continue
+        attrs = run_quiet_no_retry(
+            ["git", "--git-dir", str(bare_path), "show", f"{branch_ref}:.gitattributes"],
+        )
+        if attrs and "filter=lfs" in attrs:
+            return True
+    return False
 
 
 def fetch_lfs_objects(bare_path, source_url_with_token: str, repo_name: str):
     """
     `git clone --mirror` kopiert nur die LFS-POINTER, nicht die
-    Dateiinhalte. Ohne diesen Schritt ist das Backup bei LFS-Repos in
-    allen vier Zielen unvollstaendig - ohne jede Fehlermeldung.
+    Dateiinhalte. Wird nur aufgerufen, wenn repo_uses_lfs() (FIX P)
+    zuvor einen Treffer gemeldet hat.
     """
     if shutil.which("git-lfs") is None:
         return
@@ -989,9 +1159,10 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     """
     Wesentliche Aenderungen gegenueber der Erstfassung:
       - Plattenplatz wird VOR dem Klonen geprueft
-      - LFS-Objekte werden mitgeholt
-      - jeder Push ist atomar UND wird verifiziert
+      - LFS-Objekte werden NUR bei tatsaechlichem Bedarf mitgeholt (FIX P)
+      - jeder Push ist atomar UND wird verifiziert (Refs nur 1x berechnet, FIX S)
       - der Default-Branch wird im GitHub-Ziel gesetzt
+      - jeder Schritt wird einzeln zeitgestempelt (FIX R)
       - overall_ok wird nur True, wenn die VERIFIKATION sauber war,
         nicht schon dann, wenn der Push-Befehl nicht gemeckert hat
     """
@@ -1000,6 +1171,7 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     size_kb = int(repo.get("size") or 0)
     summary_log(f"--- {name} (Default-Branch: {default_branch or 'unbekannt'}, "
                 f"ca. {size_kb / 1024:.0f} MB) ---")
+    repo_start = time.monotonic()
 
     if not check_disk_space(WORKDIR, size_kb, name):
         return False
@@ -1009,10 +1181,18 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     source_url = repo["clone_url"].replace("https://", f"https://{SRC_GH_TOKEN}@")
 
     try:
-        bare_path = mirror_clone_local(name, source_url)
-        fetch_lfs_objects(bare_path, source_url, name)
-        src_ref_count = len(local_refs(bare_path))
-        summary_log(f"     (Quelle enthaelt {src_ref_count} Refs)")
+        with timed(f"Klonen {name}"):
+            bare_path = mirror_clone_local(name, source_url)
+
+        uses_lfs = repo_uses_lfs(bare_path)
+        if uses_lfs:
+            with timed(f"LFS-Fetch {name}"):
+                fetch_lfs_objects(bare_path, source_url, name)
+        else:
+            summary_log("     (LFS uebersprungen - GIT_LFS_MODE steht auf 'never'/kein Treffer)")
+
+        src_refs = local_refs(bare_path)
+        summary_log(f"     (Quelle enthaelt {len(src_refs)} Refs)")
     except Exception as e:  # noqa: BLE001
         summary_log(f"  !! FEHLER beim Klonen von {name}: {e}")
         cleanup_local_mirror(bare_path)
@@ -1023,9 +1203,12 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
         try:
             ensure_github_target_repo(name)
             target = f"https://{BACKUP_GH_TOKEN}@github.com/{BACKUP_GH_OWNER}/{name}.git"
-            if not push_branches_and_tags(bare_path, target, "GitHub-Backup-Account", name):
+            if not push_branches_and_tags(bare_path, target, "GitHub-Backup-Account", name,
+                                          src_refs=src_refs):
                 overall_ok = False
-            push_lfs_objects(bare_path, target, "GitHub-Backup-Account", name)
+            if uses_lfs:
+                with timed(f"LFS-Push GitHub-Backup-Account {name}"):
+                    push_lfs_objects(bare_path, target, "GitHub-Backup-Account", name)
             sync_github_default_branch(BACKUP_GH_TOKEN, BACKUP_GH_OWNER, name, default_branch)
         except Exception as e:  # noqa: BLE001
             summary_log(f"  !! FEHLER (GitHub-Backup) bei {name}: {e}")
@@ -1037,9 +1220,12 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
             safe_path = ensure_gitlab_target_repo(name)
             host = GITLAB_URL.replace("https://", "")
             target = f"https://oauth2:{GITLAB_TOKEN}@{host}/{GITLAB_NAMESPACE}/{safe_path}.git"
-            if not push_branches_and_tags(bare_path, target, "GitLab-Account-#1", name):
+            if not push_branches_and_tags(bare_path, target, "GitLab-Account-#1", name,
+                                          src_refs=src_refs):
                 overall_ok = False
-            push_lfs_objects(bare_path, target, "GitLab-Account-#1", name)
+            if uses_lfs:
+                with timed(f"LFS-Push GitLab-Account-#1 {name}"):
+                    push_lfs_objects(bare_path, target, "GitLab-Account-#1", name)
         except Exception as e:  # noqa: BLE001
             summary_log(f"  !! FEHLER (GitLab-Account-#1) bei {name}: {e}")
             overall_ok = False
@@ -1053,7 +1239,8 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
             target = (f"https://oauth2:{GITLAB2_TOKEN}@{host}/"
                       f"{GITLAB2_NAMESPACE}/{safe_dated_path}.git")
             if not push_branches_and_tags(bare_path, target,
-                                          "GitLab-Account-#2 (datiert)", name):
+                                          "GitLab-Account-#2 (datiert)", name,
+                                          src_refs=src_refs):
                 overall_ok = False
         except Exception as e:  # noqa: BLE001
             summary_log(f"  !! FEHLER (GitLab-Account-#2) bei {name}: {e}")
@@ -1062,17 +1249,21 @@ def process_repo(repo: dict, run_timestamp_suffix: str) -> bool:
     # --- Ziel 4: Google Drive ---
     if GDRIVE_SA_JSON and GDRIVE_FOLDER_ID:
         try:
-            backup_to_drive(bare_path, name)
+            with timed(f"Google-Drive-Backup {name}"):
+                backup_to_drive(bare_path, name)
         except Exception as e:  # noqa: BLE001
             summary_log(f"  !! FEHLER (Google Drive) bei {name}: {e}")
             overall_ok = False
 
     cleanup_local_mirror(bare_path)
 
+    repo_duration = time.monotonic() - repo_start
     if overall_ok:
-        summary_log(f"  OK ({name}) - alle Ziele verifiziert vollstaendig")
+        summary_log(f"  OK ({name}) - alle Ziele verifiziert vollstaendig "
+                    f"(Gesamtdauer: {repo_duration:.1f}s)")
     else:
-        summary_log(f"  UNVOLLSTAENDIG ({name}) - siehe Details oben")
+        summary_log(f"  UNVOLLSTAENDIG ({name}) - siehe Details oben "
+                    f"(Gesamtdauer: {repo_duration:.1f}s)")
     return overall_ok
 
 
@@ -1084,6 +1275,9 @@ def main():
     console_heartbeat("Backup gestartet.")
     summary_log("===== Repo-Backup gestartet =====")
     summary_log(f"Zeitstempel fuer GitLab-Account-#2 (UTC): {run_timestamp_suffix}")
+    summary_log(f"GIT_LFS_MODE={GIT_LFS_MODE} | GIT_PACK_THREADS="
+                f"{_pack_threads_override or '(Git-Standard)'} | GIT_COMPRESSION_LEVEL="
+                f"{_compression_override or '(Git-Standard)'}")
 
     ok, failed, failed_names = 0, 0, []
 
