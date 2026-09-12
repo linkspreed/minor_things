@@ -2,16 +2,9 @@ name: Repo Super-Backup
 
 on:
   schedule:
-    # Alle 6 Stunden = 4x täglich: 00:00, 06:00, 12:00, 18:00 UTC
-    # (≈ 02:00, 08:00, 14:00, 20:00 Uhr Sommerzeit in München;
-    #  ≈ 01:00, 07:00, 13:00, 19:00 Uhr Winterzeit in München)
     - cron: '0 */6 * * *'
-  workflow_dispatch: {}     # erlaubt manuelles Starten über den "Run workflow"-Button
+  workflow_dispatch: {}
 
-# Verhindert, dass zwei Läufe gleichzeitig laufen (z.B. ein geplanter
-# 6-Stunden-Trigger überschneidet sich mit einem manuellen Start). Ein
-# neuer Lauf wartet, bis der vorherige fertig ist, statt parallel zu
-# laufen.
 concurrency:
   group: repo-super-backup
   cancel-in-progress: false
@@ -23,10 +16,10 @@ jobs:
 
     steps:
       - name: Repo auschecken
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Python einrichten
-        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
         with:
           python-version: '3.12'
 
@@ -35,43 +28,31 @@ jobs:
 
       - name: Backup ausführen
         id: run_backup
-        continue-on-error: true   # WICHTIG: Ein Fehler hier darf die Benachrichtigung unten nicht verhindern
+        continue-on-error: true
         env:
-          # --- Quelle: dein Haupt-GitHub-Account ---
           SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
           SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
-          # --- Ziel 1: zweiter GitHub-Account ---
           BACKUP_GH_TOKEN: ${{ secrets.BACKUP_GH_TOKEN }}
           BACKUP_GH_OWNER: ${{ vars.BACKUP_GH_OWNER }}
           BACKUP_GH_OWNER_TYPE: ${{ vars.BACKUP_GH_OWNER_TYPE }}
-          # --- Ziel 2: GitLab-Account #1 (überschreibt/mirrort) ---
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GITLAB_NAMESPACE: ${{ vars.GITLAB_NAMESPACE }}
           GITLAB_URL: ${{ vars.GITLAB_URL }}
-          # --- Ziel 3: GitLab-Account #2 (legt JEDEN Lauf neue, datierte Projekte an) ---
           GITLAB2_TOKEN: ${{ secrets.GITLAB2_TOKEN }}
           GITLAB2_NAMESPACE: ${{ vars.GITLAB2_NAMESPACE }}
           GITLAB2_URL: ${{ vars.GITLAB2_URL }}
-          # --- Ziel 4: Google Drive ---
           GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_BACKUP_FOLDER_NAME: ${{ vars.GDRIVE_BACKUP_FOLDER_NAME }}
-          # --- Allgemeine Einstellungen ---
           QUIET_CONSOLE: "true"
           CLEAN_LOCAL_MIRROR_AFTER_EACH_REPO: "true"
           EMAIL_SUMMARY_FILE: "email_summary.txt"
           MAX_RETRIES: "3"
           RETRY_BASE_DELAY_SECONDS: "3"
-          # --- Performance-Fix (28.08.2026): bestätigt kein Repo nutzt
-          # Git-LFS -> LFS-Schritt (teurer History-Scan) komplett
-          # überspringen. Bei zukünftigem LFS-Einsatz auf "auto" (nur
-          # günstige .gitattributes-Prüfung) oder "always" umstellen.
           GIT_LFS_MODE: "never"
         run: python backup_repos.py
 
-      # Benachrichtigung über Google Chat - läuft IMMER (if: always()),
-      # egal ob der Backup-Schritt oben erfolgreich war oder nicht.
       - name: Ergebnis an Google Chat senden
         if: always()
         env:

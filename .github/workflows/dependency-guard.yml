@@ -14,13 +14,9 @@ on:
         default: 'pr+issue'
         type: string
   schedule:
-    # Nur Notfall-Netz, falls Apps Script ausfaellt. Bewusst 30 Minuten
-    # versetzt, damit es nicht mit dem Apps-Script-Lauf kollidiert.
     - cron: '30 3 * * *'
     - cron: '30 17 * * *'
 
-# Der automatische Token bekommt KEINE Rechte. Alles laeuft ueber den
-# explizit vergebenen SRC_GH_TOKEN mit eng gefassten Berechtigungen.
 permissions: {}
 
 concurrency:
@@ -32,33 +28,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      # persist-credentials: false verhindert, dass der GITHUB_TOKEN
-      # in der lokalen Git-Konfiguration liegen bleibt, wo spaetere
-      # Schritte ihn versehentlich mitnehmen koennten.
       - name: Steuer-Repo auschecken
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
 
       - name: Python einrichten
-        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
         with:
           python-version: '3.12'
 
       - name: Node einrichten
-        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
         with:
           node-version: '20'
 
       - name: Abhaengigkeiten installieren
         run: pip install --quiet -r requirements.txt
 
-      # Version gepinnt UND Checksumme geprueft. Ohne die Pruefung
-      # waere ein manipuliertes Release ein direkter Weg zu unseren
-      # Secrets - der Scanner laeuft schliesslich im selben Job.
-      # Den erwarteten SHA256 einmalig aus der Datei
-      # osv-scanner_SHA256SUMS des jeweiligen Releases uebernehmen
-      # und hier als Secret OSV_SHA256 hinterlegen.
       - name: OSV-Scanner installieren und verifizieren
         env:
           OSV_VERSION: v2.5.1
@@ -79,12 +66,10 @@ jobs:
         id: run_guard
         continue-on-error: true
         env:
-          # --- Quelle (alles als Secret, siehe Kopfkommentar) ---
           SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
           SRC_GH_OWNER: ${{ secrets.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ secrets.SRC_GH_OWNER_TYPE }}
 
-          # --- Report-Zustellung ---
           REPORT_TO: ${{ secrets.REPORT_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -93,7 +78,6 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
 
-          # --- Verhalten ---
           FIX_MODE: ${{ github.event.inputs.fix_mode || 'pr+issue' }}
           MIN_FIX_SEVERITY: 'HIGH'
           DEPENDABOT_CROSSCHECK: 'true'
@@ -105,11 +89,6 @@ jobs:
           RETRY_BASE_DELAY_SECONDS: '3'
         run: python dependency_guard.py
 
-      # Die Benachrichtigung enthaelt bewusst KEINE Inhalte mehr.
-      # Der vollstaendige Report geht ausschliesslich per E-Mail an
-      # den privaten Verteiler. Hier wird nur gemeldet, DASS ein Lauf
-      # stattgefunden hat und ob er technisch sauber war - das ist
-      # fuer einen Aussenstehenden wertlos.
       - name: Statusmeldung an Google Chat
         if: always()
         env:
@@ -140,9 +119,6 @@ jobs:
               print("Benachrichtigung fehlgeschlagen.")
           PYEOF
 
-      # Letzte Absicherung: falls ein Lauf abbricht, bevor das Skript
-      # selbst aufraeumen konnte, duerfen keine Klone oder Reports auf
-      # dem Runner zurueckbleiben.
       - name: Arbeitsdaten restlos entfernen
         if: always()
         run: |
