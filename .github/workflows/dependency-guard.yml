@@ -1,0 +1,129 @@
+name: Dependency-Guard
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Woher kam der Trigger'
+        required: false
+        default: 'manual'
+        type: string
+      fix_mode:
+        description: 'off | pr | issue | pr+issue'
+        required: false
+        default: 'pr+issue'
+        type: string
+  schedule:
+    - cron: '30 3 * * *'
+    - cron: '30 17 * * *'
+
+permissions: {}
+
+concurrency:
+  group: dependency-guard
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Steuer-Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+
+      - name: Node einrichten
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '20'
+
+      - name: Abhaengigkeiten installieren
+        run: pip install --quiet -r requirements.txt
+
+      - name: OSV-Scanner installieren und verifizieren
+        env:
+          OSV_VERSION: v2.5.1
+          OSV_SHA256: ${{ secrets.OSV_SHA256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          if [ -n "${OSV_SHA256}" ]; then
+            echo "${OSV_SHA256}  osv-scanner" | sha256sum -c -
+          else
+            echo "WARNUNG: keine Checksumme hinterlegt - bitte OSV_SHA256 setzen."
+          fi
+          chmod +x osv-scanner
+          sudo mv osv-scanner /usr/local/bin/osv-scanner
+
+      - name: Dependency-Scan ausfuehren
+        id: run_guard
+        continue-on-error: true
+        env:
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ secrets.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ secrets.SRC_GH_OWNER_TYPE }}
+
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+
+          FIX_MODE: ${{ github.event.inputs.fix_mode || 'pr+issue' }}
+          MIN_FIX_SEVERITY: 'HIGH'
+          DEPENDABOT_CROSSCHECK: 'true'
+          CHECK_OUTDATED: 'true'
+          SKIP_ARCHIVED: 'true'
+          SKIP_FORKS: 'true'
+          REPO_DENYLIST: ${{ secrets.REPO_DENYLIST }}
+          MAX_RETRIES: '3'
+          RETRY_BASE_DELAY_SECONDS: '3'
+        run: python dependency_guard.py
+
+      - name: Statusmeldung an Google Chat
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCAN_OUTCOME: ${{ steps.run_guard.outcome }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request
+
+          webhook = os.environ.get("WEBHOOK_URL")
+          if not webhook:
+              raise SystemExit(0)
+
+          outcome = os.environ.get("SCAN_OUTCOME", "unknown")
+          icon = "✅" if outcome == "success" else "❌"
+          text = (f"{icon} Dependency Guard: Lauf beendet (Status: {outcome}).\n"
+                  f"Der vollstaendige Report wurde per E-Mail zugestellt.\n"
+                  f"Lauf: {os.environ.get('RUN_URL','')}")
+
+          req = urllib.request.Request(
+              webhook, data=json.dumps({"text": text}).encode("utf-8"),
+              headers={"Content-Type": "application/json; charset=UTF-8"}, method="POST")
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Benachrichtigung gesendet: HTTP {resp.status}")
+          except Exception:
+              print("Benachrichtigung fehlgeschlagen.")
+          PYEOF
+
+      - name: Arbeitsdaten restlos entfernen
+        if: always()
+        run: |
+          rm -rf guard_clones dependency_report.txt dependency_report.html osv_result.json || true
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_guard.outcome != 'success'
+        run: exit 1
