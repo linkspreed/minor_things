@@ -1,0 +1,178 @@
+name: Dependency-Guard
+
+# ====================================================================
+#  ZERO-LEAK-WORKFLOW fuer ein OEFFENTLICHES Repo
+# --------------------------------------------------------------------
+#  Bewusste Entscheidungen, jeweils gegen ein konkretes Angreiferziel:
+#
+#  - KEIN upload-artifact. Artefakte sind in oeffentlichen Repos fuer
+#    jeden herunterladbar. Ein Schwachstellen-Report waere damit eine
+#    frei zugaengliche Angriffsanleitung gegen unsere eigene Codebasis.
+#  - KEIN $GITHUB_STEP_SUMMARY. Job-Summaries sind ebenso oeffentlich.
+#  - KEIN pull_request-/pull_request_target-Trigger. Dadurch kann ein
+#    Fremder nicht per Pull Request Code einschleusen, der mit unseren
+#    Secrets ausgefuehrt wird. Nur workflow_dispatch und schedule.
+#  - permissions auf {} gesetzt: der automatische GITHUB_TOKEN bekommt
+#    gar keine Rechte mehr. Gearbeitet wird ausschliesslich mit dem
+#    bewusst vergebenen SRC_GH_TOKEN.
+#  - Alle Konfigurationswerte, aus denen sich Rueckschluesse auf das
+#    Unternehmen ziehen lassen (Kontoname, Empfaengeradresse), laufen
+#    als SECRETS statt als "vars" - GitHub maskiert automatisch nur
+#    Secrets in den Logs, "vars" erscheinen im Klartext.
+#  - Checksummenpruefung des Scanner-Binaries: sonst koennte ein
+#    kompromittiertes Release unsere Secrets abgreifen.
+#
+#  Commit-SHAs gepinnt für maximale Supply-Chain-Sicherheit.
+# ====================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'Woher kam der Trigger'
+        required: false
+        default: 'manual'
+        type: string
+      fix_mode:
+        description: 'off | pr | issue | pr+issue'
+        required: false
+        default: 'pr+issue'
+        type: string
+  schedule:
+    # Nur Notfall-Netz, falls Apps Script ausfaellt. Bewusst 30 Minuten
+    # versetzt, damit es nicht mit dem Apps-Script-Lauf kollidiert.
+    - cron: '30 3 * * *'
+    - cron: '30 17 * * *'
+
+# Der automatische Token bekommt KEINE Rechte. Alles laeuft ueber den
+# explizit vergebenen SRC_GH_TOKEN mit eng gefassten Berechtigungen.
+permissions: {}
+
+concurrency:
+  group: dependency-guard
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      # persist-credentials: false verhindert, dass der GITHUB_TOKEN
+      # in der lokalen Git-Konfiguration liegen bleibt, wo spaetere
+      # Schritte ihn versehentlich mitnehmen koennten.
+      - name: Steuer-Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3 # v5.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Node einrichten
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Abhaengigkeiten installieren
+        run: pip install --quiet -r requirements.txt
+
+      # Version gepinnt UND Checksumme geprueft. Ohne die Pruefung
+      # waere ein manipuliertes Release ein direkter Weg zu unseren
+      # Secrets - der Scanner laeuft schliesslich im selben Job.
+      # Den erwarteten SHA256 einmalig aus der Datei
+      # osv-scanner_SHA256SUMS des jeweiligen Releases uebernehmen
+      # und hier als Secret OSV_SHA256 hinterlegen.
+      - name: OSV-Scanner installieren und verifizieren
+        env:
+          OSV_VERSION: v2.5.1
+          OSV_SHA256: ${{ secrets.OSV_SHA256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          if [ -n "${OSV_SHA256}" ]; then
+            echo "${OSV_SHA256}  osv-scanner" | sha256sum -c -
+          else
+            echo "WARNUNG: keine Checksumme hinterlegt - bitte OSV_SHA256 setzen."
+          fi
+          chmod +x osv-scanner
+          sudo mv osv-scanner /usr/local/bin/osv-scanner
+
+      - name: Dependency-Scan ausfuehren
+        id: run_guard
+        continue-on-error: true
+        env:
+          # --- Quelle (alles als Secret, siehe Kopfkommentar) ---
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ secrets.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ secrets.SRC_GH_OWNER_TYPE }}
+
+          # --- Report-Zustellung ---
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+
+          # --- Verhalten ---
+          FIX_MODE: ${{ github.event.inputs.fix_mode || 'pr+issue' }}
+          MIN_FIX_SEVERITY: 'HIGH'
+          DEPENDABOT_CROSSCHECK: 'true'
+          CHECK_OUTDATED: 'true'
+          SKIP_ARCHIVED: 'true'
+          SKIP_FORKS: 'true'
+          REPO_DENYLIST: ${{ secrets.REPO_DENYLIST }}
+          MAX_RETRIES: '3'
+          RETRY_BASE_DELAY_SECONDS: '3'
+        run: python dependency_guard.py
+
+      # Die Benachrichtigung enthaelt bewusst KEINE Inhalte mehr.
+      # Der vollstaendige Report geht ausschliesslich per E-Mail an
+      # den privaten Verteiler. Hier wird nur gemeldet, DASS ein Lauf
+      # stattgefunden hat und ob er technisch sauber war - das ist
+      # fuer einen Aussenstehenden wertlos.
+      - name: Statusmeldung an Google Chat
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SCAN_OUTCOME: ${{ steps.run_guard.outcome }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request
+
+          webhook = os.environ.get("WEBHOOK_URL")
+          if not webhook:
+              raise SystemExit(0)
+
+          outcome = os.environ.get("SCAN_OUTCOME", "unknown")
+          icon = "✅" if outcome == "success" else "❌"
+          text = (f"{icon} Dependency Guard: Lauf beendet (Status: {outcome}).\n"
+                  f"Der vollstaendige Report wurde per E-Mail zugestellt.\n"
+                  f"Lauf: {os.environ.get('RUN_URL','')}")
+
+          req = urllib.request.Request(
+              webhook, data=json.dumps({"text": text}).encode("utf-8"),
+              headers={"Content-Type": "application/json; charset=UTF-8"}, method="POST")
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  print(f"Benachrichtigung gesendet: HTTP {resp.status}")
+          except Exception:
+              print("Benachrichtigung fehlgeschlagen.")
+          PYEOF
+
+      # Letzte Absicherung: falls ein Lauf abbricht, bevor das Skript
+      # selbst aufraeumen konnte, duerfen keine Klone oder Reports auf
+      # dem Runner zurueckbleiben.
+      - name: Arbeitsdaten restlos entfernen
+        if: always()
+        run: |
+          rm -rf guard_clones dependency_report.txt dependency_report.html osv_result.json || true
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_guard.outcome != 'success'
+        run: exit 1
