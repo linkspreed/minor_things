@@ -15,6 +15,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
+from common import send_email_report
 
 def env(name, required=False, default=None):
     val = os.environ.get(name, default)
@@ -622,6 +623,12 @@ def main():
         header += 'Repos mit mindestens einem Problem: ' + ', '.join(failed_names) + '\n'
     header += '\n----- Vollstaendiges Protokoll -----\n'
     SUMMARY_FILE.write_text(header + '\n'.join(SUMMARY_LINES) + '\n', encoding='utf-8')
+    subject = f'Repo Super-Backup Ergebnis ({subject_status})'
+    body = f'{header}\nDer ungekuerzte vollstaendige Report befindet sich als Anhang im Dateianhang.'
+    try:
+        send_email_report(subject, body, attachments=[SUMMARY_FILE])
+    except Exception:
+        pass
     sys.exit(1 if failed > 0 else 0)
 if __name__ == '__main__':
     try:

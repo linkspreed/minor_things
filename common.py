@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import os
 import re
+import smtplib
 import sys
 import time
 from datetime import datetime, timezone
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 import requests
 
@@ -120,6 +124,38 @@ def send_google_chat(webhook_url: str, text: str, max_len: int=4000):
         requests.post(webhook_url, json={'text': text}, timeout=30, headers={'Content-Type': 'application/json; charset=UTF-8'})
     except Exception as e:
         print(f'Fehler beim Senden an Google Chat: {e}', flush=True)
+
+def send_email_report(subject: str, body_text: str, attachments: list=None, logger=None) -> bool:
+    smtp_user = os.environ.get('SMTP_USER')
+    smtp_pass = os.environ.get('SMTP_PASS')
+    report_to = os.environ.get('REPORT_TO', 'hello@linkspreed.com')
+    smtp_host = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+    smtp_from = os.environ.get('SMTP_FROM', smtp_user or '')
+    if not (smtp_user and smtp_pass and report_to):
+        return False
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = smtp_from or smtp_user
+    msg['To'] = report_to
+    msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
+    for att in (attachments or []):
+        path = Path(att)
+        if not path.exists():
+            continue
+        filename = path.name
+        content = path.read_bytes()
+        part = MIMEApplication(content, Name=filename)
+        part['Content-Disposition'] = f'attachment; filename="{filename}"'
+        msg.attach(part)
+
+    def _send():
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(msg['From'], [report_to], msg.as_string())
+    with_retry(_send, 'Report-Mail senden', logger=logger)
+    return True
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
