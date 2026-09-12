@@ -1,30 +1,5 @@
 name: Dependency-Guard
 
-# ====================================================================
-#  ZERO-LEAK-WORKFLOW fuer ein OEFFENTLICHES Repo
-# --------------------------------------------------------------------
-#  Bewusste Entscheidungen, jeweils gegen ein konkretes Angreiferziel:
-#
-#  - KEIN upload-artifact. Artefakte sind in oeffentlichen Repos fuer
-#    jeden herunterladbar. Ein Schwachstellen-Report waere damit eine
-#    frei zugaengliche Angriffsanleitung gegen unsere eigene Codebasis.
-#  - KEIN $GITHUB_STEP_SUMMARY. Job-Summaries sind ebenso oeffentlich.
-#  - KEIN pull_request-/pull_request_target-Trigger. Dadurch kann ein
-#    Fremder nicht per Pull Request Code einschleusen, der mit unseren
-#    Secrets ausgefuehrt wird. Nur workflow_dispatch und schedule.
-#  - permissions auf {} gesetzt: der automatische GITHUB_TOKEN bekommt
-#    gar keine Rechte mehr. Gearbeitet wird ausschliesslich mit dem
-#    bewusst vergebenen SRC_GH_TOKEN.
-#  - Alle Konfigurationswerte, aus denen sich Rueckschluesse auf das
-#    Unternehmen ziehen lassen (Kontoname, Empfaengeradresse), laufen
-#    als SECRETS statt als "vars" - GitHub maskiert automatisch nur
-#    Secrets in den Logs, "vars" erscheinen im Klartext.
-#  - Checksummenpruefung des Scanner-Binaries: sonst koennte ein
-#    kompromittiertes Release unsere Secrets abgreifen.
-#
-#  Commit-SHAs gepinnt für maximale Supply-Chain-Sicherheit.
-# ====================================================================
-
 on:
   workflow_dispatch:
     inputs:
