@@ -54,10 +54,11 @@ jobs:
           set -euo pipefail
           curl -sSfL -o osv-scanner \
             "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
-          if [ -n "${OSV_SHA256}" ]; then
-            echo "${OSV_SHA256}  osv-scanner" | sha256sum -c -
+          CLEAN_SHA=$(echo "${OSV_SHA256}" | grep -oE '[a-fA-F0-9]{64}' | tr '[:upper:]' '[:lower:]' | head -n 1)
+          if [ -n "${CLEAN_SHA}" ]; then
+            echo "${CLEAN_SHA}  osv-scanner" | sha256sum -c -
           else
-            echo "WARNUNG: keine Checksumme hinterlegt - bitte OSV_SHA256 setzen."
+            echo "WARNUNG: keine gueltige SHA256-Checksumme hinterlegt - bitte OSV_SHA256 setzen."
           fi
           chmod +x osv-scanner
           sudo mv osv-scanner /usr/local/bin/osv-scanner
