@@ -105,9 +105,9 @@ def console_heartbeat(msg: str = None):
         if msg:
             print(msg, flush=True)
         else:
-            print(f"... Pruefe Repo {_repo_index}/{_repo_total} ...", flush=True)
+            print("... Pruefe ein Repo ...", flush=True)
     else:
-        print(msg or f"Repo {_repo_index}/{_repo_total}", flush=True)
+        print(msg or "... Pruefe ein Repo ...", flush=True)
 
 
 # ====================================================================
@@ -345,4 +345,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:  # noqa: BLE001
+        print("Ein unerwarteter Fehler ist aufgetreten.", file=sys.stderr, flush=True)
+        sys.exit(1)
