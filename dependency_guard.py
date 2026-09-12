@@ -3,16 +3,13 @@ import json
 import os
 import re
 import shutil
-import smtplib
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 import requests
-from common import env, Redactor, SummaryLogger, list_github_repos, http_get, http_post, send_google_chat, with_retry
+from common import env, Redactor, SummaryLogger, list_github_repos, http_get, http_post, send_google_chat, send_email_report
 
 def _silent_excepthook(exc_type, exc_value, exc_tb):
     print('Unerwarteter Fehler - Details ausschliesslich im privaten Report.', flush=True)
@@ -361,24 +358,6 @@ def build_report(repo_reports: list, stats: dict, duration: int) -> tuple:
     html.append("<hr><p style='color:#888;font-size:12px'>Automatisch erzeugt vom Dependency Guard. Datenbasis: OSV.dev sowie die offiziellen Paket-Registries. <b>Vertraulich - enthaelt ausnutzbare Schwachstellen.</b></p></body></html>")
     return ('\n'.join(text), '\n'.join(html))
 
-def send_report_mail(subject: str, text_body: str, html_body: str) -> bool:
-    if not (SMTP_USER and SMTP_PASS and REPORT_TO):
-        return False
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = SMTP_FROM or SMTP_USER
-    msg['To'] = REPORT_TO
-    msg.attach(MIMEText(text_body, 'plain', 'utf-8'))
-    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
-
-    def _send():
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(msg['From'], [REPORT_TO], msg.as_string())
-    with_retry(_send, 'Report-Mail senden', logger=log)
-    return True
-
 def shred(path: Path):
     try:
         if path.exists():
@@ -478,9 +457,10 @@ def main():
     REPORT_TEXT_FILE.write_text(text_report, encoding='utf-8')
     REPORT_HTML_FILE.write_text(html_report, encoding='utf-8')
     subject = f"{SEVERITY_ICON.get(stats['level'], '✅')} Dependency-Report {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC – {stats['CRITICAL']} kritisch / {stats['HIGH']} hoch"
+    body_summary = f"{subject}\n\nDer vollstaendige Dependency-Guard-Report befindet sich im Anhang dieser E-Mail (HTML und Text formatierte Reports).\n\nZusammenfassung:\n- Repos geprueft: {stats['repos']}\n- Repos mit Schwachstellen: {stats['repos_vuln']}\n- Repos mit Fehlern: {stats['repos_error']}\n- Schwachstellen: {stats['CRITICAL']} kritisch, {stats['HIGH']} hoch, {stats['MEDIUM']} mittel, {stats['LOW']} niedrig\n- Erstellte PRs: {stats['prs']} | Issues: {stats['issues']}\n- Dauer: {duration}s\n"
     mail_ok = False
     try:
-        mail_ok = send_report_mail(subject, text_report, html_report)
+        mail_ok = send_email_report(subject, body_summary, attachments=[REPORT_HTML_FILE, REPORT_TEXT_FILE], logger=log)
     except Exception:
         mail_ok = False
     chat_ok = False
