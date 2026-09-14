@@ -4,9 +4,9 @@ from pathlib import Path
 from common import env, Redactor, SummaryLogger, list_github_repos, send_google_chat
 SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
 SRC_GH_OWNER = env('SRC_GH_OWNER', required=True)
-SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
+SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user'), 'Web4-Web2App'
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK', required=True)
-DEFAULT_PUBLIC_WHITELIST = ['General_Linkspreed', 'linkspreed', 'log', 'LS-W4-Mini-RF_Addiction_Impact', 'minor_things', 'Oxygen', 'smm', 'Web4-Community-AI-Prompt-Lab', 'Web4-Community-Name-Generator-AI', 'Web4-Communitys-Audience-Architect', 'Web4-Lite', 'Web4-Lite-SchemaGuard', 'Web4-Role-Tailor', 'Web4-Rules-Generator-AI', 'Web4-Structura', 'Web4-Web2App']
+DEFAULT_PUBLIC_WHITELIST = ['General_Linkspreed', 'linkspreed', 'log', 'LS-W4-Mini-RF_Addiction_Impact', 'minor_things', 'Oxygen', 'smm', 'Web4-Community-AI-Prompt-Lab', 'Web4-Community-Name-Generator-AI', 'Web4-Communitys-Audience-Architect', 'Web4-Lite', 'Web4-Lite-SchemaGuard', 'Web4-Role-Tailor', 'Web4-Rules-Generator-AI', 'Web4-Structura', 'Web4-Web2App', 'status']
 
 def build_whitelist():
     names = list(DEFAULT_PUBLIC_WHITELIST)
