@@ -1,0 +1,97 @@
+name: Attack-Surface-Scan
+
+on:
+  schedule:
+    - cron: '42 4 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: attack-surface-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+
+      - name: Abhaengigkeiten installieren
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
+
+      # subfinder und httpx (ProjectDiscovery, MIT-Lizenz) werden dynamisch als
+      # jeweils neueste Release-Version geladen und gegen die vom Hersteller im
+      # selben Release veroeffentlichte checksums.txt verifiziert - kein
+      # manuell zu pflegendes SHA256-Secret noetig.
+      - name: subfinder installieren (neueste Version, checksumverifiziert)
+        run: |
+          set -euo pipefail
+          REPO="projectdiscovery/subfinder"
+          REL_JSON=$(curl -sSfL "https://api.github.com/repos/${REPO}/releases/latest")
+          TAG=$(echo "$REL_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          VER="${TAG#v}"
+          ASSET="subfinder_${VER}_linux_amd64.zip"
+          SUMS="subfinder_${VER}_checksums.txt"
+          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true
+          if [ -s "$SUMS" ]; then
+            grep " ${ASSET}\$" "$SUMS" | sha256sum -c -
+          fi
+          unzip -o "$ASSET" subfinder > /dev/null
+          chmod +x subfinder
+          sudo mv subfinder /usr/local/bin/subfinder
+        shell: bash
+
+      - name: httpx installieren (neueste Version, checksumverifiziert)
+        run: |
+          set -euo pipefail
+          REPO="projectdiscovery/httpx"
+          REL_JSON=$(curl -sSfL "https://api.github.com/repos/${REPO}/releases/latest")
+          TAG=$(echo "$REL_JSON" | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          VER="${TAG#v}"
+          ASSET="httpx_${VER}_linux_amd64.zip"
+          SUMS="httpx_${VER}_checksums.txt"
+          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
+          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true
+          if [ -s "$SUMS" ]; then
+            grep " ${ASSET}\$" "$SUMS" | sha256sum -c -
+          fi
+          unzip -o "$ASSET" httpx > /dev/null
+          chmod +x httpx
+          sudo mv httpx /usr/local/bin/httpx
+        shell: bash
+
+      - name: Attack-Surface-Scan ausfuehren
+        id: run_scan
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_EXCLUDE: ${{ secrets.CLOUDFLARE_ZONE_EXCLUDE }}
+          ATTACK_SURFACE_IGNORE_HOSTS: ${{ secrets.ATTACK_SURFACE_IGNORE_HOSTS }}
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_SUMMARY_FILE: "attack_surface_summary.txt"
+        run: python attack_surface_scan.py > /dev/null 2>&1
+
+      - name: Arbeitsdaten restlos entfernen
+        if: always()
+        run: rm -f attack_surface_summary.txt *.zip *checksums.txt > /dev/null 2>&1 || true
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_scan.outcome != 'success'
+        run: exit 1
