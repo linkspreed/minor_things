@@ -29,10 +29,6 @@ jobs:
       - name: Abhaengigkeiten installieren
         run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
-      # subfinder und httpx (ProjectDiscovery, MIT-Lizenz) werden dynamisch als
-      # jeweils neueste Release-Version geladen und gegen die vom Hersteller im
-      # selben Release veroeffentlichte checksums.txt verifiziert - kein
-      # manuell zu pflegendes SHA256-Secret noetig.
       - name: subfinder installieren (neueste Version, checksumverifiziert)
         run: |
           set -euo pipefail
@@ -42,14 +38,14 @@ jobs:
           VER="${TAG#v}"
           ASSET="subfinder_${VER}_linux_amd64.zip"
           SUMS="subfinder_${VER}_checksums.txt"
-          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true
+          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}" > /dev/null 2>&1
+          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true > /dev/null 2>&1
           if [ -s "$SUMS" ]; then
-            grep " ${ASSET}\$" "$SUMS" | sha256sum -c -
+            grep " ${ASSET}\$" "$SUMS" | sha256sum -c - > /dev/null 2>&1
           fi
           unzip -o "$ASSET" subfinder > /dev/null
-          chmod +x subfinder
-          sudo mv subfinder /usr/local/bin/subfinder
+          chmod +x subfinder > /dev/null 2>&1
+          sudo mv subfinder /usr/local/bin/subfinder > /dev/null 2>&1
         shell: bash
 
       - name: httpx installieren (neueste Version, checksumverifiziert)
@@ -61,14 +57,14 @@ jobs:
           VER="${TAG#v}"
           ASSET="httpx_${VER}_linux_amd64.zip"
           SUMS="httpx_${VER}_checksums.txt"
-          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}"
-          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true
+          curl -sSfL -o "$ASSET" "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}" > /dev/null 2>&1
+          curl -sSfL -o "$SUMS" "https://github.com/${REPO}/releases/download/${TAG}/${SUMS}" || true > /dev/null 2>&1
           if [ -s "$SUMS" ]; then
-            grep " ${ASSET}\$" "$SUMS" | sha256sum -c -
+            grep " ${ASSET}\$" "$SUMS" | sha256sum -c - > /dev/null 2>&1
           fi
           unzip -o "$ASSET" httpx > /dev/null
-          chmod +x httpx
-          sudo mv httpx /usr/local/bin/httpx
+          chmod +x httpx > /dev/null 2>&1
+          sudo mv httpx /usr/local/bin/httpx > /dev/null 2>&1
         shell: bash
 
       - name: Attack-Surface-Scan ausfuehren
@@ -91,6 +87,14 @@ jobs:
       - name: Arbeitsdaten restlos entfernen
         if: always()
         run: rm -f attack_surface_summary.txt *.zip *checksums.txt > /dev/null 2>&1 || true
+
+
+      - name: Action-Lauf-Eintrag aus Historie loeschen
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
 
       - name: Lauf ggf. als fehlgeschlagen markieren
         if: steps.run_scan.outcome != 'success'

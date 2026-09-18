@@ -67,7 +67,6 @@ def main():
         lines.append(f'\nOhne SBOM/Dependency-Graph ({len(no_sbom)}): ' + ', '.join(no_sbom[:20]))
     send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
     Path('license_check_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print(f'Lizenz-Check abgeschlossen. {len(findings)} Repo(s) mit Treffern.', flush=True)
     sys.exit(1 if findings else 0)
 if __name__ == '__main__':
     try:

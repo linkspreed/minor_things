@@ -16,7 +16,6 @@ import requests
 def env(name, required=False, default=None):
     val = os.environ.get(name, default)
     if required and (not val):
-        print(f'FEHLER: Pflicht-Konfiguration fehlt (Name absichtlich nicht angezeigt).')
         sys.exit(1)
     return val
 SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
@@ -53,11 +52,11 @@ def summary_log(msg: str):
 def console_heartbeat(msg: str=None):
     if QUIET_CONSOLE:
         if msg:
-            print(msg, flush=True)
+            pass
         else:
-            print('... Verarbeite ein Repo ...', flush=True)
+            pass
     else:
-        print(msg or '... Verarbeite ein Repo ...', flush=True)
+        pass
 
 class SheetsRateLimiter:
 
@@ -530,5 +529,4 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
-        print('Ein unerwarteter Fehler ist aufgetreten.', file=sys.stderr, flush=True)
         sys.exit(1)

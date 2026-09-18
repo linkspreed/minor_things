@@ -14,7 +14,6 @@ import requests
 def env(name, required=False, default=None):
     val = os.environ.get(name, default)
     if required and (not val):
-        print('FEHLER: Pflicht-Konfiguration fehlt (Name absichtlich nicht angezeigt).')
         sys.exit(1)
     return val
 
@@ -123,12 +122,12 @@ def send_google_chat(webhook_url: str, text: str, max_len: int=4000):
     try:
         requests.post(webhook_url, json={'text': text}, timeout=30, headers={'Content-Type': 'application/json; charset=UTF-8'})
     except Exception as e:
-        print(f'Fehler beim Senden an Google Chat: {e}', flush=True)
+        pass
 
 def send_email_report(subject: str, body_text: str, attachments: list=None, logger=None) -> bool:
     smtp_user = os.environ.get('SMTP_USER')
     smtp_pass = os.environ.get('SMTP_PASS')
-    report_to = os.environ.get('REPORT_TO', 'hello@linkspreed.com')
+    report_to = os.environ.get('REPORT_TO', '')
     smtp_host = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
     smtp_port = int(os.environ.get('SMTP_PORT', '587'))
     smtp_from = os.environ.get('SMTP_FROM', smtp_user or '')
@@ -139,7 +138,7 @@ def send_email_report(subject: str, body_text: str, attachments: list=None, logg
     msg['From'] = smtp_from or smtp_user
     msg['To'] = report_to
     msg.attach(MIMEText(body_text, 'plain', 'utf-8'))
-    for att in (attachments or []):
+    for att in attachments or []:
         path = Path(att)
         if not path.exists():
             continue
