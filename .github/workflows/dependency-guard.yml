@@ -79,7 +79,7 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
 
-          FIX_MODE: ${{ github.event.inputs.fix_mode || 'pr+issue' }}
+          FIX_MODE: 'off'
           MIN_FIX_SEVERITY: 'HIGH'
           DEPENDABOT_CROSSCHECK: 'true'
           CHECK_OUTDATED: 'true'

@@ -24,7 +24,7 @@ SMTP_PORT = int(env('SMTP_PORT', default='587'))
 SMTP_USER = env('SMTP_USER')
 SMTP_PASS = env('SMTP_PASS')
 SMTP_FROM = env('SMTP_FROM', default=SMTP_USER or '')
-FIX_MODE = env('FIX_MODE', default='pr+issue').lower()
+FIX_MODE = env('FIX_MODE', default='off').lower()
 FIX_BRANCH_PREFIX = env('FIX_BRANCH_PREFIX', default='dependency-guard/fix')
 MIN_FIX_SEVERITY = env('MIN_FIX_SEVERITY', default='HIGH').upper()
 DEPENDABOT_CROSSCHECK = env('DEPENDABOT_CROSSCHECK', default='true').lower() == 'true'
@@ -286,10 +286,7 @@ def findings_markdown(findings: list) -> str:
 
 def remediate(repo_path: Path, owner: str, repo: str, default_branch: str, findings: list) -> dict:
     result = {'pr': None, 'issue': None}
-    threshold = SEVERITY_ORDER.get(MIN_FIX_SEVERITY, 3)
-    relevant = [f for f in findings if SEVERITY_ORDER.get(f['severity'], 0) >= threshold]
-    if not relevant or FIX_MODE == 'off':
-        return result
+    return result
     changed = False
     if FIX_MODE in ('pr', 'pr+issue'):
         try:
