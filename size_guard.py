@@ -95,7 +95,6 @@ def main():
     log.log('\n'.join(lines))
     send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
     Path('size_guard_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print('Groessen-/Kosten-Check abgeschlossen.', flush=True)
 if __name__ == '__main__':
     try:
         main()

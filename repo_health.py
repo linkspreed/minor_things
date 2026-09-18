@@ -50,7 +50,6 @@ def main():
         lines.append('\nKeine Repos ueber der Inaktivitaets-Schwelle.')
     send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
     Path('repo_health_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print('Repo-Gesundheits-Check abgeschlossen.', flush=True)
 if __name__ == '__main__':
     try:
         main()

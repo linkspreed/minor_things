@@ -1,0 +1,57 @@
+name: TLS-Security-Header-Check
+
+on:
+  schedule:
+    - cron: '20 5 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: tls-security-header-check
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+
+      - name: Abhaengigkeiten installieren
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
+
+      - name: TLS-/Security-Header-Check ausfuehren
+        id: run_scan
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_EXCLUDE: ${{ secrets.CLOUDFLARE_ZONE_EXCLUDE }}
+          CERT_EXPIRY_WARN_DAYS: "21"
+          CERT_EXPIRY_CRITICAL_DAYS: "7"
+          HSTS_MIN_MAX_AGE_SECONDS: "15552000"
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_SUMMARY_FILE: "tls_header_summary.txt"
+        run: python tls_security_header_check.py > /dev/null 2>&1
+
+      - name: Arbeitsdaten restlos entfernen
+        if: always()
+        run: rm -f tls_header_summary.txt > /dev/null 2>&1 || true
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_scan.outcome != 'success'
+        run: exit 1

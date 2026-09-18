@@ -57,7 +57,6 @@ def upload_index_to_drive(local_path: Path):
 
 def main():
     if not (GDRIVE_SA_JSON and GDRIVE_FOLDER_ID):
-        print('Cross-Repo-Index: Google-Drive-Ziel nicht konfiguriert, Skript wird uebersprungen.', flush=True)
         sys.exit(0)
     log.log('Cross-Repo-Index-Aufbau gestartet.')
     try:
@@ -69,7 +68,6 @@ def main():
     failed = []
     for i, repo in enumerate(repos, start=1):
         name = repo['name']
-        print(f'... Indexiere Repo {i}/{len(repos)} ...', flush=True)
         try:
             clone_url = repo['clone_url'].replace('https://', f'https://{SRC_GH_TOKEN}@')
             repo_path = shallow_clone(name, clone_url)
@@ -90,7 +88,6 @@ def main():
             failed.append('__upload__')
     shutil.rmtree(WORKDIR, ignore_errors=True)
     Path('cross_repo_index_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print(f'Cross-Repo-Index abgeschlossen. {len(repos) - len(failed)} von {len(repos)} Repos indexiert.', flush=True)
     sys.exit(1 if failed else 0)
 if __name__ == '__main__':
     try:

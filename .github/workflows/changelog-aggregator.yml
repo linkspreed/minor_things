@@ -9,6 +9,8 @@ concurrency:
   group: changelog-aggregator
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   aggregate:
     runs-on: ubuntu-latest
@@ -23,7 +25,7 @@ jobs:
           python-version: '3.12'
 
       - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: Changelog aggregieren
         env:
@@ -32,4 +34,4 @@ jobs:
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           CHANGELOG_LOOKBACK_DAYS: "7"
-        run: python changelog_aggregator.py
+        run: python changelog_aggregator.py > /dev/null 2>&1

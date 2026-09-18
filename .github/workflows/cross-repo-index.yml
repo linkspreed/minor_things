@@ -9,6 +9,8 @@ concurrency:
   group: cross-repo-index
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   build-index:
     runs-on: ubuntu-latest
@@ -23,10 +25,10 @@ jobs:
           python-version: '3.12'
 
       - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: ripgrep installieren
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y ripgrep > /dev/null 2>&1
 
       - name: Index bauen und hochladen
         env:
@@ -35,4 +37,4 @@ jobs:
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
-        run: python cross_repo_index.py
+        run: python cross_repo_index.py > /dev/null 2>&1

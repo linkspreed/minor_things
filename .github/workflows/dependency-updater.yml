@@ -9,6 +9,8 @@ concurrency:
   group: dependency-updater
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   rollout:
     runs-on: ubuntu-latest
@@ -23,7 +25,7 @@ jobs:
           python-version: '3.12'
 
       - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: Dependabot-Konfiguration ausrollen
         env:
@@ -31,4 +33,4 @@ jobs:
           SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-        run: python dependency_updater.py
+        run: python dependency_updater.py > /dev/null 2>&1

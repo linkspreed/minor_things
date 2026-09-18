@@ -12,14 +12,13 @@ import requests
 from common import env, Redactor, SummaryLogger, list_github_repos, http_get, http_post, send_google_chat, send_email_report
 
 def _silent_excepthook(exc_type, exc_value, exc_tb):
-    print('Unerwarteter Fehler - Details ausschliesslich im privaten Report.', flush=True)
     sys.exit(1)
 sys.excepthook = _silent_excepthook
 SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
 SRC_GH_OWNER = env('SRC_GH_OWNER', required=True)
 SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK')
-REPORT_TO = env('REPORT_TO', default='hello@linkspreed.com')
+REPORT_TO = env('REPORT_TO', default='')
 SMTP_HOST = env('SMTP_HOST', default='smtp.gmail.com')
 SMTP_PORT = int(env('SMTP_PORT', default='587'))
 SMTP_USER = env('SMTP_USER')
@@ -46,10 +45,10 @@ SEVERITY_ORDER = {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1, 'UNKNOWN': 0}
 SEVERITY_ICON = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'LOW': '⚪', 'UNKNOWN': '❔'}
 
 def heartbeat():
-    print('.', end='', flush=True)
+    pass
 
 def safe_console(msg: str):
-    print(msg, flush=True)
+    pass
 
 def run_osv_scanner(repo_path: Path) -> dict:
     out_file = repo_path.parent / 'osv_result.json'
@@ -447,7 +446,6 @@ def main():
         if rep['issue']:
             stats['issues'] += 1
         time.sleep(0.3)
-    print('', flush=True)
     for lvl in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'):
         if stats[lvl] > 0:
             stats['level'] = lvl

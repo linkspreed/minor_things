@@ -57,7 +57,6 @@ def main():
         lines.append('Keine neuen Releases in diesem Zeitraum.')
     send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
     Path('changelog_aggregator_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print(f'Changelog-Aggregator abgeschlossen. {len(activity)} Repo(s) mit neuen Releases.', flush=True)
 if __name__ == '__main__':
     try:
         main()
