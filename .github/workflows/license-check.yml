@@ -9,6 +9,8 @@ concurrency:
   group: license-check
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,7 +25,7 @@ jobs:
           python-version: '3.12'
 
       - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: Lizenzen prüfen
         env:
@@ -32,4 +34,4 @@ jobs:
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           DISALLOWED_LICENSES: "GPL-3.0,AGPL-3.0"
-        run: python license_check.py
+        run: python license_check.py > /dev/null 2>&1

@@ -83,10 +83,8 @@ def main():
         for name, problems in total_problems.items():
             lines.append(f'- {name}: ' + '; '.join(problems))
         send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
-        print(f'Integritaetspruefung: {len(total_problems)} Repo(s) mit Abweichungen - Meldung gesendet.', flush=True)
     else:
         log.log(f'Alle {len(repos)} Repos sind auf allen geprueften Zielen synchron.')
-        print(f'Integritaetspruefung: alle {len(repos)} Repos synchron. OK.', flush=True)
     Path('backup_integrity_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
     sys.exit(1 if total_problems else 0)
 if __name__ == '__main__':
