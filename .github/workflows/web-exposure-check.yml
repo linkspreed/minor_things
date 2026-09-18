@@ -1,0 +1,66 @@
+name: Web-Exposure-Check
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: web-exposure-check
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+
+      - name: Abhaengigkeiten installieren
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
+
+      - name: Web-Exposure-Check ausfuehren
+        id: run_scan
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_EXCLUDE: ${{ secrets.CLOUDFLARE_ZONE_EXCLUDE }}
+          WEB_EXPOSURE_IGNORE_HOSTS: ${{ secrets.WEB_EXPOSURE_IGNORE_HOSTS }}
+          CORS_EXTRA_TEST_PATHS: ${{ secrets.CORS_EXTRA_TEST_PATHS }}
+          REQUEST_TIMEOUT_SECONDS: "10"
+          MAX_BYTES_PER_FILE: "200000"
+          REQUEST_DELAY_SECONDS: "0.2"
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_SUMMARY_FILE: "web_exposure_summary.txt"
+        run: python web_exposure_check.py > /dev/null 2>&1
+
+      - name: Arbeitsdaten restlos entfernen
+        if: always()
+        run: rm -f web_exposure_summary.txt > /dev/null 2>&1 || true
+
+      - name: Action-Lauf-Eintrag aus Historie loeschen
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_scan.outcome != 'success'
+        run: exit 1
