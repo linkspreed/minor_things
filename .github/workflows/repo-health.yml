@@ -9,6 +9,8 @@ concurrency:
   group: repo-health
   cancel-in-progress: false
 
+permissions: {}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -23,7 +25,7 @@ jobs:
           python-version: '3.12'
 
       - name: Abhängigkeiten installieren
-        run: pip install -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: Gesundheits-Check ausführen
         env:
@@ -32,4 +34,4 @@ jobs:
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           INACTIVE_DAYS_THRESHOLD: "365"
-        run: python repo_health.py
+        run: python repo_health.py > /dev/null 2>&1

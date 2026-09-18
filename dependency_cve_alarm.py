@@ -11,7 +11,6 @@ from common import send_email_report
 def env(name, required=False, default=None):
     val = os.environ.get(name, default)
     if required and (not val):
-        print(f'FEHLER: Pflicht-Konfiguration fehlt (Name absichtlich nicht angezeigt).')
         sys.exit(1)
     return val
 SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
@@ -41,11 +40,11 @@ def summary_log(msg: str):
 def console_heartbeat(msg: str=None):
     if QUIET_CONSOLE:
         if msg:
-            print(msg, flush=True)
+            pass
         else:
-            print('... Pruefe ein Repo ...', flush=True)
+            pass
     else:
-        print(msg or '... Pruefe ein Repo ...', flush=True)
+        pass
 
 def with_retry(func, description: str):
     last_error = None
@@ -215,5 +214,4 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
-        print('Ein unerwarteter Fehler ist aufgetreten.', file=sys.stderr, flush=True)
         sys.exit(1)
