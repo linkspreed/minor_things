@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-Frontend-Secret-Scan: prueft ALLE live geschalteten Webseiten (Hostnamen kommen
-automatisch aus Cloudflare, ueber alle Zonen) auf versehentlich eingebaute
-API-Keys/Secrets/Tokens im tatsaechlich ausgelieferten Frontend-Code (HTML und
-verlinkte/eingebettete JavaScript-Dateien) - also genau das, was jeder
-Webseiten-Besucher im Quelltext sehen kann.
-
-WICHTIGE AENDERUNG (Fix): Jeder einzelne Host wird jetzt vollstaendig
-fehler-isoliert verarbeitet. Zuvor konnte eine unerwartete Ausnahme bei
-EINEM Host (z.B. durch eine ungewoehnliche Server-Antwort) den GESAMTEN
-Lauf abbrechen, sodass am Ende 0 von N Hosts gescannt wurden. Jetzt wird
-ein solcher Fehler pro Host abgefangen, geloggt und der Host als
-"nicht auswertbar" gezaehlt - der Lauf laeuft fuer alle anderen Hosts normal
-weiter.
-
-Gibt NICHTS auf der Konsole/im Actions-Log aus. Das vollstaendige Ergebnis
-geht ausschliesslich per E-Mail (Anhang) an REPORT_TO. Ein Lauf sendet IMMER
-eine E-Mail, auch wenn waehrend des Scans ein Fehler auftritt.
-"""
 import re
 import sys
 from datetime import datetime, timezone
@@ -29,11 +10,11 @@ from common import env, Redactor, SummaryLogger, send_google_chat, send_email_re
 from domain_common import parse_list, get_zones, get_all_records, web_hostnames
 from pathlib import Path
 
-CLOUDFLARE_API_TOKEN = env('CLOUDFLARE_API_TOKEN')  # bewusst nicht 'required=True', siehe main()
+CLOUDFLARE_API_TOKEN = env('CLOUDFLARE_API_TOKEN')
 CLOUDFLARE_ZONE_EXCLUDE = env('CLOUDFLARE_ZONE_EXCLUDE', default='')
 FRONTEND_SCAN_IGNORE_HOSTS = env('FRONTEND_SCAN_IGNORE_HOSTS', default='')
 MAX_JS_FILES_PER_HOST = int(env('MAX_JS_FILES_PER_HOST', default='25'))
-MAX_BYTES_PER_FILE = int(env('MAX_BYTES_PER_FILE', default='3000000'))  # ~3 MB Deckel pro Datei
+MAX_BYTES_PER_FILE = int(env('MAX_BYTES_PER_FILE', default='3000000'))
 REQUEST_TIMEOUT = int(env('REQUEST_TIMEOUT_SECONDS', default='15'))
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK')
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='frontend_secret_scan_summary.txt'))
@@ -42,7 +23,6 @@ redact = Redactor([CLOUDFLARE_API_TOKEN])
 log = SummaryLogger(redact)
 SEVERITY_ICON = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'INFO': '⚪', 'NONE': '✅'}
 
-# --- Bekannte Secret-Muster (Name, Regex, Schweregrad, Hinweistext) ---
 SECRET_PATTERNS = [
     ('AWS Access Key ID', re.compile(r'\bAKIA[0-9A-Z]{16}\b'), 'CRITICAL',
      'AWS-Zugriffsschluessel im Frontend-Code gefunden - AWS-Keys gehoeren NIEMALS ins Frontend.'),
@@ -125,12 +105,6 @@ def scan_content(content: str, source_label: str) -> list:
 
 
 def scan_host(host: str) -> tuple:
-    """Gibt (findings, error) zurueck. error ist gesetzt, wenn der Host nicht
-    erreichbar war ODER wenn bei der Auswertung ein unerwarteter Fehler
-    auftrat. WICHTIG: Diese Funktion wirft selbst KEINE Ausnahme mehr nach
-    aussen - jede Verarbeitungsstufe ist einzeln abgesichert, damit ein
-    einzelner kaputter Host niemals den gesamten Lauf abbricht (das war der
-    Bug hinter "Hosts erfolgreich gescannt: 0")."""
     findings = []
     base_url = None
     last_err = None
@@ -154,7 +128,7 @@ def scan_host(host: str) -> tuple:
         for m in INLINE_SCRIPT_RE.finditer(html):
             findings.extend(scan_content(m.group(1), f'{host} (Inline-<script>-Block)'))
     except Exception:
-        pass  # nicht kritisch - die HTML-Funde oben bleiben trotzdem gueltig
+        pass
 
     try:
         js_urls = collect_js_urls(base_url, html)
@@ -236,11 +210,6 @@ def main():
         records = get_all_records(CLOUDFLARE_API_TOKEN, zones, logger=log)
         hosts = web_hostnames(records)
 
-        # --- FIX: jeder Host wird jetzt einzeln fehler-isoliert verarbeitet ---
-        # Vorher konnte eine Ausnahme bei EINEM Host (z.B. durch eine
-        # ungewoehnliche Server-Antwort) diesen kompletten try-Block verlassen
-        # und damit ALLE restlichen Hosts ungescannt lassen. Jetzt faengt das
-        # try/except direkt in der Schleife jeden Fehler pro Host ab.
         for host in hosts:
             if host in ignore_hosts:
                 continue
