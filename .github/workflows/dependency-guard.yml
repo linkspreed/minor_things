@@ -44,7 +44,7 @@ jobs:
           node-version: '20'
 
       - name: Abhaengigkeiten installieren
-        run: pip install --quiet -r requirements.txt
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
       - name: OSV-Scanner installieren und verifizieren
         env:
@@ -53,15 +53,15 @@ jobs:
         run: |
           set -euo pipefail
           curl -sSfL -o osv-scanner \
-            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64" > /dev/null 2>&1
           CLEAN_SHA=$(echo "${OSV_SHA256}" | grep -oE '[a-fA-F0-9]{64}' | tr '[:upper:]' '[:lower:]' | head -n 1)
           if [ -n "${CLEAN_SHA}" ]; then
             echo "${CLEAN_SHA}  osv-scanner" | sha256sum -c -
           else
             echo "WARNUNG: keine gueltige SHA256-Checksumme hinterlegt - bitte OSV_SHA256 setzen."
           fi
-          chmod +x osv-scanner
-          sudo mv osv-scanner /usr/local/bin/osv-scanner
+          chmod +x osv-scanner > /dev/null 2>&1
+          sudo mv osv-scanner /usr/local/bin/osv-scanner > /dev/null 2>&1
 
       - name: Dependency-Scan ausfuehren
         id: run_guard
@@ -79,7 +79,7 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
 
-          FIX_MODE: ${{ github.event.inputs.fix_mode || 'pr+issue' }}
+          FIX_MODE: 'off'
           MIN_FIX_SEVERITY: 'HIGH'
           DEPENDABOT_CROSSCHECK: 'true'
           CHECK_OUTDATED: 'true'
@@ -88,7 +88,7 @@ jobs:
           REPO_DENYLIST: ${{ secrets.REPO_DENYLIST }}
           MAX_RETRIES: '3'
           RETRY_BASE_DELAY_SECONDS: '3'
-        run: python dependency_guard.py
+        run: python dependency_guard.py > /dev/null 2>&1
 
       - name: Statusmeldung an Google Chat
         if: always()
@@ -97,7 +97,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SCAN_OUTCOME: ${{ steps.run_guard.outcome }}
         run: |
-          python3 << 'PYEOF'
+          python3 << 'PYEOF' > /dev/null 2>&1
           import json, os, urllib.request
 
           webhook = os.environ.get("WEBHOOK_URL")
@@ -115,9 +115,9 @@ jobs:
               headers={"Content-Type": "application/json; charset=UTF-8"}, method="POST")
           try:
               with urllib.request.urlopen(req, timeout=30) as resp:
-                  print(f"Benachrichtigung gesendet: HTTP {resp.status}")
+                  pass
           except Exception:
-              print("Benachrichtigung fehlgeschlagen.")
+              pass
           PYEOF
 
       - name: Arbeitsdaten restlos entfernen

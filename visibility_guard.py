@@ -4,7 +4,7 @@ from pathlib import Path
 from common import env, Redactor, SummaryLogger, list_github_repos, send_google_chat
 SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
 SRC_GH_OWNER = env('SRC_GH_OWNER', required=True)
-SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user'), 'Web4-Web2App'
+SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK', required=True)
 DEFAULT_PUBLIC_WHITELIST = ['General_Linkspreed', 'linkspreed', 'log', 'LS-W4-Mini-RF_Addiction_Impact', 'minor_things', 'Oxygen', 'smm', 'Web4-Community-AI-Prompt-Lab', 'Web4-Community-Name-Generator-AI', 'Web4-Communitys-Audience-Architect', 'Web4-Lite', 'Web4-Lite-SchemaGuard', 'Web4-Role-Tailor', 'Web4-Rules-Generator-AI', 'Web4-Structura', 'Web4-Web2App', 'status']
 
@@ -27,7 +27,6 @@ def main():
         repos = list_github_repos(SRC_GH_TOKEN, SRC_GH_OWNER, SRC_GH_OWNER_TYPE, logger=log)
     except Exception as e:
         log.log(f'!! FEHLER beim Abrufen der Repo-Liste: {e}')
-        print('Visibility-Check: Fehler beim Abrufen der Repo-Liste.', flush=True)
         sys.exit(1)
     public_repos = [r['name'] for r in repos if r.get('private') is False]
     allowed = sorted([n for n in public_repos if n.lower() in WHITELIST], key=str.lower)
@@ -38,12 +37,10 @@ def main():
         msg = '🚨 WARNUNG: Unerwartet oeffentlich sichtbare Repos gefunden!\n\n' + '\n'.join((f'- {name}' for name in unexpected)) + "\n\nBitte SOFORT in GitHub pruefen und ggf. auf 'private' zuruecksetzen."
         log.log(f"{len(unexpected)} unerwartet oeffentliche(s) Repo(s): {', '.join(unexpected)}")
         send_google_chat(GOOGLE_CHAT_WEBHOOK, msg)
-        print(f'Visibility-Check: {len(unexpected)} unerwartet oeffentliche(s) Repo(s) gefunden - Alarm gesendet.', flush=True)
     else:
         msg = f'✅ Visibility-Check: keine unerwartet oeffentlichen Repos.\nGeprueft: {len(repos)} Repo(s) | oeffentlich (erlaubt per Whitelist): {len(allowed)}'
         log.log(f'Alles ok. Geprueft: {len(repos)} Repos, davon {len(allowed)} erlaubt oeffentlich.')
         send_google_chat(GOOGLE_CHAT_WEBHOOK, msg)
-        print(f'Visibility-Check: OK - keine unerwartet oeffentlichen Repos ({len(repos)} geprueft).', flush=True)
     Path('visibility_guard_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
 if __name__ == '__main__':
     try:

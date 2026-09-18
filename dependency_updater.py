@@ -72,7 +72,6 @@ def main():
         lines.append(f'Fehlgeschlagen: {len(failed)} - ' + ', '.join(failed))
     send_google_chat(GOOGLE_CHAT_WEBHOOK, '\n'.join(lines))
     Path('dependency_updater_summary.txt').write_text('\n'.join(log.lines) + '\n', encoding='utf-8')
-    print(f'Dependency-Updater: {len(created)} neu, {len(already_present)} vorhanden, {len(failed)} Fehler.', flush=True)
     sys.exit(1 if failed else 0)
 if __name__ == '__main__':
     try:

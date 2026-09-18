@@ -1,36 +1,18 @@
 #!/usr/bin/env python3
-"""
-E-Mail-Authentifizierungs-Check: SPF, DMARC, DKIM (R-12, Policy 2.4
-"SPF, DKIM und DMARC enforced at p=reject").
-
-Liest die TXT-Eintraege direkt aus der Cloudflare-API (alle Zonen) - das ist
-genauer als eine oeffentliche DNS-Abfrage (keine Cache-/Propagations-
-Verzoegerung) und findet DKIM-Eintraege zuverlaessig, OHNE Selektoren raten
-zu muessen: jeder TXT-Eintrag unter "*._domainkey.<domain>" wird automatisch
-erkannt, unabhaengig vom verwendeten Mail-Anbieter.
-
-Gibt NICHTS auf der Konsole/im Actions-Log aus. Das vollstaendige Ergebnis
-geht ausschliesslich per E-Mail (Anhang) an REPORT_TO. Ein Lauf sendet IMMER
-eine E-Mail, auch wenn waehrend des Scans ein Fehler auftritt.
-"""
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
 from common import env, Redactor, SummaryLogger, send_google_chat, send_email_report
 from domain_common import parse_list, get_zones, get_all_records, txt_records_by_name
-
-CLOUDFLARE_API_TOKEN = env('CLOUDFLARE_API_TOKEN')  # bewusst nicht 'required=True', siehe main()
+CLOUDFLARE_API_TOKEN = env('CLOUDFLARE_API_TOKEN')
 CLOUDFLARE_ZONE_EXCLUDE = env('CLOUDFLARE_ZONE_EXCLUDE', default='')
-MONITORED_SENDING_DOMAINS_OVERRIDE = env('MONITORED_SENDING_DOMAINS', default='')  # optional Zusatz, z.B. Subdomains die selbst Mail senden
+MONITORED_SENDING_DOMAINS_OVERRIDE = env('MONITORED_SENDING_DOMAINS', default='')
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK')
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='email_auth_summary.txt'))
-
 redact = Redactor([CLOUDFLARE_API_TOKEN])
 log = SummaryLogger(redact)
 SEVERITY_ICON = {'CRITICAL': '🔴', 'HIGH': '🟠', 'MEDIUM': '🟡', 'INFO': '⚪', 'NONE': '✅'}
-
 
 def _shred(path: Path):
     try:
@@ -40,13 +22,12 @@ def _shred(path: Path):
     except Exception:
         pass
 
-
 def evaluate_spf(domain: str, txt_by_name: dict) -> tuple:
     records = [r for r in txt_by_name.get(domain, []) if r.lower().startswith('v=spf1')]
     if not records:
         return ('HIGH', 'Kein SPF-Eintrag gefunden - Absenderadresse laesst sich beliebig faelschen.')
     record = records[0]
-    m = re.search(r'([+\-~?])all\b', record)
+    m = re.search('([+\\-~?])all\\b', record)
     qualifier = m.group(1) if m else None
     if qualifier == '+':
         return ('CRITICAL', f'SPF mit "+all" gefunden ("{record}") - erlaubt praktisch JEDEM Server, in eurem Namen zu senden.')
@@ -55,7 +36,6 @@ def evaluate_spf(domain: str, txt_by_name: dict) -> tuple:
     if qualifier == '~':
         return ('MEDIUM', f'SPF nur mit "~all" (soft fail): "{record}" - Empfehlung: auf "-all" umstellen.')
     return ('HIGH', f'SPF ohne eindeutigen all-Mechanismus: "{record}" - nicht wirksam durchgesetzt.')
-
 
 def evaluate_dmarc(domain: str, txt_by_name: dict) -> tuple:
     records = [r for r in txt_by_name.get(f'_dmarc.{domain}', []) if r.lower().startswith('v=dmarc1')]
@@ -85,56 +65,42 @@ def evaluate_dmarc(domain: str, txt_by_name: dict) -> tuple:
         pass
     return base
 
-
 def evaluate_dkim(domain: str, txt_by_name: dict) -> tuple:
     matches = [name for name in txt_by_name if name.endswith(f'._domainkey.{domain}')]
     if matches:
-        selectors = sorted(m.split('._domainkey.')[0] for m in matches)
-        return ('NONE', f'DKIM gefunden (Selektor(en): {", ".join(selectors)}).')
+        selectors = sorted((m.split('._domainkey.')[0] for m in matches))
+        return ('NONE', f"DKIM gefunden (Selektor(en): {', '.join(selectors)}).")
     return ('MEDIUM', 'Kein DKIM-TXT-Eintrag ("*._domainkey.<domain>") in der Cloudflare-Zone gefunden - falls DKIM ueber einen externen Mail-Anbieter laeuft, sollte trotzdem ein CNAME/TXT-Eintrag hier in der Zone existieren. Bitte pruefen.')
-
 
 def send_final_report(level, all_findings, sending_domains, duration, fatal_error=None):
     order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'INFO': 3}
-    header = [
-        f'SEVERITY_LEVEL: {level}',
-        f'E-Mail-Authentifizierungs-Check (SPF/DMARC/DKIM) - {datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")}',
-        f'Sendende Domains geprueft: {len(sending_domains)} | Auffaelligkeiten: {len(all_findings)}',
-        f'Dauer: {duration}s',
-        '',
-    ]
+    header = [f'SEVERITY_LEVEL: {level}', f"E-Mail-Authentifizierungs-Check (SPF/DMARC/DKIM) - {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')}", f'Sendende Domains geprueft: {len(sending_domains)} | Auffaelligkeiten: {len(all_findings)}', f'Dauer: {duration}s', '']
     if fatal_error:
         header.append(f'!! Der Lauf wurde durch einen Fehler vorzeitig beendet: {fatal_error}')
         header.append('')
     if all_findings:
         header.append('----- Auffaelligkeiten (nach Schwere sortiert) -----')
         for sev, domain, check_name, detail in sorted(all_findings, key=lambda f: order.get(f[0], 9)):
-            header.append(f'{SEVERITY_ICON.get(sev, "?")} [{sev}] {domain} [{check_name}]: {detail}')
+            header.append(f"{SEVERITY_ICON.get(sev, '?')} [{sev}] {domain} [{check_name}]: {detail}")
         header.append('')
     else:
         header.append('Alle geprueften Domains: SPF (-all), DMARC (p=reject) korrekt konfiguriert, DKIM gefunden.')
     header.append('')
     header.append('----- Vollstaendiges Protokoll -----')
-
     full_report = '\n'.join(header) + '\n' + '\n'.join(log.lines) + '\n'
     SUMMARY_FILE.write_text(full_report, encoding='utf-8')
-
-    subject = f'{SEVERITY_ICON.get(level, "✅")} E-Mail-Auth-Check ({level}) - {len(all_findings)} Auffaelligkeit(en)'
+    subject = f"{SEVERITY_ICON.get(level, '✅')} E-Mail-Auth-Check ({level}) - {len(all_findings)} Auffaelligkeit(en)"
     body = f'{subject}\n\nDer vollstaendige Report befindet sich im Anhang.\n'
     try:
         send_email_report(subject, body, attachments=[SUMMARY_FILE], logger=log)
     except Exception:
         pass
-
     if GOOGLE_CHAT_WEBHOOK:
         try:
-            send_google_chat(GOOGLE_CHAT_WEBHOOK,
-                              f'{SEVERITY_ICON.get(level, "✅")} E-Mail-Auth-Check: {level} ({len(all_findings)} Auffaelligkeit(en)). Vollstaendiger Report per E-Mail.')
+            send_google_chat(GOOGLE_CHAT_WEBHOOK, f"{SEVERITY_ICON.get(level, '✅')} E-Mail-Auth-Check: {level} ({len(all_findings)} Auffaelligkeit(en)). Vollstaendiger Report per E-Mail.")
         except Exception:
             pass
-
     _shred(SUMMARY_FILE)
-
 
 def main():
     start = datetime.now(timezone.utc)
@@ -143,16 +109,14 @@ def main():
     all_findings = []
     sending_domains = []
     fatal_error = None
-
     try:
         if not CLOUDFLARE_API_TOKEN:
             raise RuntimeError('CLOUDFLARE_API_TOKEN ist nicht gesetzt (Secret fehlt oder ist leer).')
         zones = get_zones(CLOUDFLARE_API_TOKEN, zone_exclude, logger=log)
-        root_domains = sorted(z['name'] for z in zones if z.get('name'))
+        root_domains = sorted((z['name'] for z in zones if z.get('name')))
         sending_domains = sorted(set(root_domains) | set(extra_sending_domains))
         records = get_all_records(CLOUDFLARE_API_TOKEN, zones, logger=log)
         txt_by_name = txt_records_by_name(records)
-
         for domain in sending_domains:
             for check_name, fn in (('SPF', evaluate_spf), ('DMARC', evaluate_dmarc)):
                 sev, detail = fn(domain, txt_by_name)
@@ -164,20 +128,16 @@ def main():
     except Exception as e:
         fatal_error = str(e)
         log.log(f'FATAL: {fatal_error}')
-
     duration = int((datetime.now(timezone.utc) - start).total_seconds())
     level = 'NONE'
     for lvl in ('CRITICAL', 'HIGH', 'MEDIUM', 'INFO'):
-        if any(f[0] == lvl for f in all_findings):
+        if any((f[0] == lvl for f in all_findings)):
             level = lvl
             break
     if fatal_error and level == 'NONE':
         level = 'INFO'
-
     send_final_report(level, all_findings, sending_domains, duration, fatal_error)
-    sys.exit(1 if (fatal_error or level in ('CRITICAL', 'HIGH')) else 0)
-
-
+    sys.exit(1 if fatal_error or level in ('CRITICAL', 'HIGH') else 0)
 if __name__ == '__main__':
     try:
         main()

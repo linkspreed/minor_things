@@ -1,20 +1,20 @@
-name: Dangling-DNS-Scan
+name: Web-Exposure-Check
 
 on:
   schedule:
-    - cron: '12 4 * * *'
+    - cron: '30 6 * * *'
   workflow_dispatch: {}
 
 permissions: {}
 
 concurrency:
-  group: dangling-dns-scan
+  group: web-exposure-check
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Repo auschecken
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -29,12 +29,17 @@ jobs:
       - name: Abhaengigkeiten installieren
         run: pip install --quiet -r requirements.txt > /dev/null 2>&1
 
-      - name: Dangling-DNS-Scan ausfuehren
+      - name: Web-Exposure-Check ausfuehren
         id: run_scan
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ZONE_EXCLUDE: ${{ secrets.CLOUDFLARE_ZONE_EXCLUDE }}
+          WEB_EXPOSURE_IGNORE_HOSTS: ${{ secrets.WEB_EXPOSURE_IGNORE_HOSTS }}
+          CORS_EXTRA_TEST_PATHS: ${{ secrets.CORS_EXTRA_TEST_PATHS }}
+          REQUEST_TIMEOUT_SECONDS: "10"
+          MAX_BYTES_PER_FILE: "200000"
+          REQUEST_DELAY_SECONDS: "0.2"
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           REPORT_TO: ${{ secrets.REPORT_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -42,13 +47,12 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          EMAIL_SUMMARY_FILE: "dangling_dns_summary.txt"
-        run: python dangling_dns_scan.py > /dev/null 2>&1
+          EMAIL_SUMMARY_FILE: "web_exposure_summary.txt"
+        run: python web_exposure_check.py > /dev/null 2>&1
 
       - name: Arbeitsdaten restlos entfernen
         if: always()
-        run: rm -f dangling_dns_summary.txt > /dev/null 2>&1 || true
-
+        run: rm -f web_exposure_summary.txt > /dev/null 2>&1 || true
 
       - name: Action-Lauf-Eintrag aus Historie loeschen
         if: always()
