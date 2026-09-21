@@ -17,6 +17,7 @@ SRC_GH_TOKEN = env('SRC_GH_TOKEN', required=True)
 SRC_GH_OWNER = env('SRC_GH_OWNER', required=True)
 SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
 GDRIVE_SA_JSON = env('GDRIVE_SA_JSON')
+GDRIVE_FOLDER_ID = env('GDRIVE_FOLDER_ID')
 GOOGLE_CHAT_WEBHOOK = env('GOOGLE_CHAT_WEBHOOK')
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='sbom_inventory_summary.txt'))
 
@@ -153,7 +154,8 @@ def main():
     if GDRIVE_SA_JSON:
         try:
             drive_service = get_drive_service(GDRIVE_SA_JSON)
-            root_sbom_id = get_or_create_folder(drive_service, "SBOM", None)
+            root_parent = GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else None
+            root_sbom_id = get_or_create_folder(drive_service, "SBOM", root_parent)
         except Exception as e:
             log.log(f"Schwerwiegender Fehler beim Initialisieren von Google Drive: {redact(str(e))}")
 

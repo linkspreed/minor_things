@@ -40,6 +40,7 @@ jobs:
           SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
           SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
           GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
           REPORT_TO: ${{ secrets.REPORT_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
