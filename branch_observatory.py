@@ -21,7 +21,7 @@ SRC_GH_OWNER = env('SRC_GH_OWNER')
 SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
 GDRIVE_SA_JSON = env('GDRIVE_SA_JSON')
 GDRIVE_FOLDER_ID = env('GDRIVE_FOLDER_ID')
-GDRIVE_OBSERVATORY_FOLDER_NAME = env('GDRIVE_OBSERVATORY_FOLDER_NAME', default='GitHub Repository Branch Observatory')
+GDRIVE_OBSERVATORY_FOLDER_NAME = env('GDRIVE_OBSERVATORY_FOLDER_NAME', default='GitHub Branch Observatory')
 CONFIG_FILE = env('BRANCH_OBSERVATORY_CONFIG', default='branch_observatory_config.yml')
 STATE_FILE = Path(env('BRANCH_OBSERVATORY_STATE', default='branch_observatory_state.json'))
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='branch_observatory_summary.txt'))
@@ -252,19 +252,12 @@ def get_google_services(sa_json_str):
     docs_service = build('docs', 'v1', credentials=creds)
     return drive_service, docs_service
 
-def resolve_or_create_drive_folder(drive_service, folder_id, folder_name, dry_run=False):
-    if folder_id:
-        try:
-            res = with_retry(
-                lambda: drive_service.files().get(fileId=folder_id, supportsAllDrives=True, fields='id, name, trashed').execute(),
-                'Verify configured folder ID'
-            )
-            if res and not res.get('trashed'):
-                return res['id']
-        except Exception as e:
-            log.log(f"Configured GDRIVE_FOLDER_ID invalid or inaccessible ({e}), falling back to search by name")
+def resolve_or_create_drive_folder(drive_service, parent_folder_id, folder_name, dry_run=False):
+    if parent_folder_id:
+        query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and '{parent_folder_id}' in parents and trashed = false"
+    else:
+        query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
 
-    query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
     res = with_retry(
         lambda: drive_service.files().list(
             q=query,
@@ -288,6 +281,9 @@ def resolve_or_create_drive_folder(drive_service, folder_id, folder_name, dry_ru
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder'
     }
+    if parent_folder_id:
+        body['parents'] = [parent_folder_id]
+
     folder = with_retry(
         lambda: drive_service.files().create(body=body, supportsAllDrives=True, fields='id').execute(),
         f"Create Google Drive folder '{folder_name}'"
@@ -311,7 +307,7 @@ def find_document_by_repo_id(drive_service, repo_id: str):
         return files[0]
     return None
 
-def create_google_doc_for_repo(drive_service, folder_id: str, repo_id: str, doc_name: str, report_hash: str = '', dry_run=False):
+def create_google_doc_for_repo(drive_service, folder_id: str, repo_id: str, doc_name: str, dry_run=False):
     if dry_run:
         log.log(f"[DRY RUN] Would create Google Doc '{doc_name}' with github_repo_id='{repo_id}' in folder '{folder_id}'")
         return f"dry-run-doc-id-{repo_id}"
@@ -321,8 +317,7 @@ def create_google_doc_for_repo(drive_service, folder_id: str, repo_id: str, doc_
         'mimeType': 'application/vnd.google-apps.document',
         'parents': [folder_id],
         'appProperties': {
-            'github_repo_id': str(repo_id),
-            'last_report_hash': str(report_hash)
+            'github_repo_id': str(repo_id)
         }
     }
     doc_file = with_retry(
@@ -817,6 +812,8 @@ def process_single_repository(repo, token, drive_service, docs_service, folder_i
 
     doc_id = None
     existing_hash = None
+    is_newly_created = False
+
     if doc_info:
         doc_id = doc_info['id']
         app_props = doc_info.get('appProperties', {}) or {}
@@ -827,26 +824,28 @@ def process_single_repository(repo, token, drive_service, docs_service, folder_i
             update_google_doc_metadata(drive_service, doc_id, new_name=doc_title, dry_run=dry_run)
     else:
         log.log(f"No existing Google Doc found for repo ID {repo_id}. Creating new document...")
-        doc_id = create_google_doc_for_repo(drive_service, folder_id, repo_id, doc_title, report_hash=report_hash, dry_run=dry_run)
+        doc_id = create_google_doc_for_repo(drive_service, folder_id, repo_id, doc_title, dry_run=dry_run)
+        is_newly_created = True
 
-    state_last_hash = state_data.get(repo_id, {}).get('last_report_hash')
-    if (existing_hash == report_hash or state_last_hash == report_hash) and not dry_run:
-        log.log(f"Report content unchanged for '{full_name}' (hash: {report_hash[:8]}). Skipping document update.")
-        return True, "No change required"
+    if not is_newly_created:
+        state_last_hash = state_data.get(repo_id, {}).get('last_report_hash')
+        if (existing_hash == report_hash or state_last_hash == report_hash) and not dry_run:
+            log.log(f"Report content unchanged for '{full_name}' (hash: {report_hash[:8]}). Skipping document update.")
+            return True, "No change required"
 
-    existing_doc_obj = None
-    if docs_service and not dry_run:
-        existing_text, existing_doc_obj = get_existing_doc_text_content(docs_service, doc_id)
-        if existing_text:
-            existing_text_hash = hashlib.sha256(existing_text.encode('utf-8')).hexdigest()
-            if existing_text_hash == report_hash:
-                log.log(f"Existing document body content is identical for '{full_name}'. Skipping update.")
-                if drive_service and existing_hash != report_hash:
-                    update_google_doc_metadata(drive_service, doc_id, report_hash=report_hash, dry_run=dry_run)
-                return True, "No change required"
+        existing_doc_obj = None
+        if docs_service and not dry_run:
+            existing_text, existing_doc_obj = get_existing_doc_text_content(docs_service, doc_id)
+            if existing_text:
+                existing_text_hash = hashlib.sha256(existing_text.encode('utf-8')).hexdigest()
+                if existing_text_hash == report_hash:
+                    log.log(f"Existing document body content is identical for '{full_name}'. Skipping update.")
+                    if drive_service and existing_hash != report_hash:
+                        update_google_doc_metadata(drive_service, doc_id, report_hash=report_hash, dry_run=dry_run)
+                    return True, "No change required"
 
     if docs_service:
-        overwrite_google_doc_content(docs_service, doc_id, report_content, existing_doc_obj=existing_doc_obj, dry_run=dry_run)
+        overwrite_google_doc_content(docs_service, doc_id, report_content, dry_run=dry_run)
         if drive_service and not dry_run:
             update_google_doc_metadata(drive_service, doc_id, report_hash=report_hash, dry_run=dry_run)
 
