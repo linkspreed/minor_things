@@ -1,0 +1,106 @@
+name: GitHub Branch Observatory
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without creating or modifying Google Drive documents"
+        type: boolean
+        default: false
+
+concurrency:
+  group: branch-observatory
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  observatory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Python einrichten
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+
+      - name: Abhängigkeiten installieren
+        run: pip install --quiet -r requirements.txt > /dev/null 2>&1
+
+      - name: Branch Observatory ausführen
+        id: run_observatory
+        continue-on-error: true
+        env:
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ vars.SRC_GH_OWNER_TYPE }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ vars.GDRIVE_FOLDER_ID }}
+          GDRIVE_OBSERVATORY_FOLDER_NAME: ${{ vars.GDRIVE_OBSERVATORY_FOLDER_NAME }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          STALE_DAYS: "30"
+          VERY_STALE_DAYS: "90"
+          EMAIL_SUMMARY_FILE: "branch_observatory_summary.txt"
+        run: python branch_observatory.py > /dev/null 2>&1
+
+      - name: Ergebnis an Google Chat senden
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OBSERVATORY_OUTCOME: ${{ steps.run_observatory.outcome }}
+        run: |
+          python3 << 'PYEOF' > /dev/null 2>&1
+          import json
+          import os
+          import urllib.request
+
+          webhook_url = os.environ.get("WEBHOOK_URL")
+          if not webhook_url:
+              raise SystemExit(0)
+
+          outcome = os.environ.get("OBSERVATORY_OUTCOME", "unknown")
+          run_url = os.environ.get("RUN_URL", "")
+          icon = "✅" if outcome == "success" else "❌"
+
+          try:
+              with open("branch_observatory_summary.txt", "r", encoding="utf-8") as f:
+                  content = f.read()
+          except FileNotFoundError:
+              content = "Keine Zusammenfassung gefunden."
+
+          max_len = 3500
+          if len(content) > max_len:
+              content = "...(gekuerzt)...\n" + content[-max_len:]
+
+          text = f"{icon} Branch Observatory Ergebnis\n\n{content}\n\nDetails: {run_url}"
+          payload = json.dumps({"text": text}).encode("utf-8")
+
+          req = urllib.request.Request(
+              webhook_url, data=payload,
+              headers={"Content-Type": "application/json; charset=UTF-8"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=30):
+                  pass
+          except Exception:
+              pass
+          PYEOF
+
+      - name: Lauf ggf. als fehlgeschlagen markieren
+        if: steps.run_observatory.outcome != 'success'
+        run: exit 1
+
+      - name: Action-Lauf-Eintrag aus Historie loeschen
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
