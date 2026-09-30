@@ -1,0 +1,13 @@
+settings:
+  stale_days_threshold: 30
+  very_stale_days_threshold: 90
+  include_archived: true
+  folder_name: "GitHub Repository Branch Observatory"
+
+repositories:
+  example-owner/example-repo:
+    branches:
+      feature/eudi-wallet:
+        parent: develop
+      hotfix/session-timeout:
+        parent: release/2.4
