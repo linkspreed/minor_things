@@ -609,19 +609,55 @@ def build_topology_tree(branches_data, default_branch):
     return "\n".join(lines)
 
 def build_mermaid_graph(branches_data, default_branch):
-    lines = ["```mermaid", "graph TD"]
-    for b in branches_data:
+    lines = ["gitGraph:"]
+
+    sorted_chrono = sorted(
+        branches_data,
+        key=lambda x: (x['commit_dt_utc'] if x['commit_dt_utc'] else datetime.min.replace(tzinfo=timezone.utc))
+    )
+
+    created_branches = set([default_branch])
+    active_branch = default_branch
+
+    def_branch_obj = next((b for b in branches_data if b['name'] == default_branch), None)
+    init_date = "2026-01-01"
+    init_sha = "init"
+    if def_branch_obj and def_branch_obj['commit_date_str'] != 'Unknown':
+        init_date = def_branch_obj['commit_date_str'].split(' ')[0]
+        init_sha = def_branch_obj['sha_short']
+
+    lines.append(f'    commit id: "{init_date} {init_sha}: Initial commit"')
+
+    for b in sorted_chrono:
         b_name = b['name']
-        is_def = " (Default)" if b_name == default_branch else ""
-        lines.append(f'    "{b_name}{is_def}"')
+        if b_name == default_branch:
+            continue
 
-    for b in branches_data:
-        child_name = b['name']
         parent_name = b['parent_info']['parent']
-        if parent_name and parent_name not in ('None (Default Branch)', 'Unknown') and parent_name != child_name:
-            lines.append(f'    "{parent_name}" --> "{child_name}"')
+        if parent_name not in created_branches or parent_name == 'Unknown' or parent_name == 'None (Default Branch)':
+            parent_name = default_branch
 
-    lines.append("```")
+        if active_branch != parent_name:
+            lines.append(f'    checkout "{parent_name}"')
+            active_branch = parent_name
+
+        lines.append(f'    branch "{b_name}"')
+        lines.append(f'    checkout "{b_name}"')
+        created_branches.add(b_name)
+        active_branch = b_name
+
+        dt_part = b['commit_date_str'].split(' ')[0] if b['commit_date_str'] != 'Unknown' else "2026-09-30"
+        msg_part = re.sub(r'["\\]', '', b['commit_message'][:25]) if b['commit_message'] else "Update"
+        commit_id_str = f"{dt_part} {b['sha_short']}: {msg_part}"
+
+        if b['merged']:
+            lines.append(f'    commit id: "{commit_id_str}"')
+            lines.append(f'    checkout "{parent_name}"')
+            lines.append(f'    merge "{b_name}"')
+            active_branch = parent_name
+        else:
+            lines.append(f'    commit id: "{commit_id_str}" type: HIGHLIGHT tag: "OPEN"')
+
     return "\n".join(lines)
 
 def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt_utc):
@@ -690,7 +726,7 @@ def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt
     report.append(tree_text)
     report.append("")
 
-    report.append("--- MERMAID BRANCH GRAPH ---")
+    report.append("--- MERMAID GITGRAPH DIAGRAM ---")
     mermaid_text = build_mermaid_graph(branches_data, default_branch)
     report.append(mermaid_text)
     report.append("")
