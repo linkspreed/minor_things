@@ -5,7 +5,10 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +33,7 @@ STALE_DAYS_THRESHOLD = int(env('STALE_DAYS', default='30'))
 VERY_STALE_DAYS_THRESHOLD = int(env('VERY_STALE_DAYS', default='90'))
 MAX_RETRIES = int(env('MAX_RETRIES', default='3'))
 RETRY_BASE_DELAY = float(env('RETRY_BASE_DELAY', default='3.0'))
+MAX_API_BRANCHES = int(env('MAX_API_BRANCHES', default='20'))
 
 _SECRET_LIST = [s for s in [SRC_GH_TOKEN, GDRIVE_SA_JSON] if s]
 
@@ -330,110 +334,208 @@ def upload_or_update_file(service, folder_id: str, file_name: str, content_str: 
         )
         return res.get('id', '')
 
-def determine_parent_branch(token, owner, repo_name, branch_name, default_branch, all_branches, prs, config_overrides):
-    branch_map = {b['name']: b for b in all_branches}
-    if branch_name == default_branch:
-        return {
-            'parent': 'None (Default Branch)',
-            'type': 'Recorded',
-            'confidence': 'High',
-            'reason': 'This branch is designated as the repository default branch.'
-        }
+def compute_local_git_merge_bases(clone_url, token):
+    merge_bases = {}
+    auth_url = clone_url.replace('https://', f'https://{token}@')
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        try:
+            subprocess.run(['git', 'clone', '--filter=blob:none', '--no-checkout', auth_url, str(tmp_dir)], capture_output=True, text=True, check=True, timeout=300)
+            res = subprocess.run(['git', 'for-each-ref', '--format=%(refname:short)|%(objectname)', 'refs/remotes/origin/'], cwd=tmp_dir, capture_output=True, text=True, check=True)
+            branches = {}
+            for line in res.stdout.splitlines():
+                if '|' in line:
+                    ref, sha = line.strip().split('|', 1)
+                    b_name = ref.replace('origin/', '')
+                    if b_name != 'HEAD':
+                        branches[b_name] = sha
 
+            b_list = list(branches.keys())
+            for i in range(len(b_list)):
+                for j in range(len(b_list)):
+                    if i == j:
+                        continue
+                    b1, b2 = b_list[i], b_list[j]
+                    mb_res = subprocess.run(['git', 'merge-base', f'origin/{b1}', f'origin/{b2}'], cwd=tmp_dir, capture_output=True, text=True)
+                    if mb_res.returncode == 0:
+                        mb_sha = mb_res.stdout.strip()
+                        if mb_sha:
+                            merge_bases[(b1, b2)] = mb_sha
+        except Exception as e:
+            log.log(f"Warning: Blobless partial clone merge-base computation failed: {redact(str(e))}")
+    return merge_bases
+
+def is_reachable(parent, child, parent_map):
+    curr = parent_map.get(child)
+    visited = set()
+    while curr and curr not in ('None (Default Branch)', 'Unknown'):
+        if curr in visited:
+            break
+        visited.add(curr)
+        if curr == parent:
+            return True
+        curr = parent_map.get(curr)
+    return False
+
+def resolve_all_parent_branches(token, owner, repo_name, default_branch, raw_branches, all_prs, config_overrides, clone_url=''):
+    branch_map = {b['name']: b for b in raw_branches}
     repo_key = f"{owner}/{repo_name}"
-    if repo_key in config_overrides and 'branches' in config_overrides[repo_key]:
-        branch_cfg = config_overrides[repo_key]['branches'].get(branch_name, {})
-        if 'parent' in branch_cfg:
-            p = branch_cfg['parent']
-            return {
-                'parent': p,
-                'type': 'Configured',
-                'confidence': 'High',
-                'reason': "Manually configured parent in repository configuration overrides."
-            }
 
-    for pr in prs:
+    branch_commit_dates = {}
+    for b in raw_branches:
+        b_name = b['name']
+        sha = b.get('commit', {}).get('sha', '')
+        dt = datetime.min.replace(tzinfo=timezone.utc)
+        if sha:
+            c_detail = http_gh_request('GET', f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}", token)
+            if c_detail.status_code == 200:
+                d_raw = c_detail.json().get('commit', {}).get('committer', {}).get('date')
+                if d_raw:
+                    try:
+                        dt = datetime.strptime(d_raw, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+        branch_commit_dates[b_name] = dt
+
+    pr_base_map = {}
+    for pr in all_prs:
         head_ref = pr.get('head', {}).get('ref')
-        if head_ref == branch_name:
-            base_ref = pr.get('base', {}).get('ref')
-            if base_ref and base_ref in branch_map and base_ref != branch_name:
-                pr_num = pr.get('number')
-                return {
-                    'parent': base_ref,
-                    'type': 'Pull request based',
-                    'confidence': 'High',
-                    'reason': f"Declared base branch in Pull Request #{pr_num} ({pr.get('state', 'open')})."
-                }
+        base_ref = pr.get('base', {}).get('ref')
+        if head_ref and base_ref and base_ref in branch_map and head_ref != base_ref:
+            pr_base_map[head_ref] = (base_ref, pr.get('number'))
 
-    best_parent = None
-    min_ahead = float('inf')
-    best_confidence = 'Low'
-    best_reason = ''
+    use_local_clone = len(raw_branches) > MAX_API_BRANCHES and clone_url
+    local_merge_bases = {}
+    if use_local_clone:
+        log.log(f"Repository has {len(raw_branches)} branches (> {MAX_API_BRANCHES}). Using Blobless Partial Clone for fast DAG merge-base analysis.")
+        local_merge_bases = compute_local_git_merge_bases(clone_url, token)
 
-    for cand_name in branch_map:
-        if cand_name == branch_name:
-            continue
-        comp = compare_refs(token, owner, repo_name, cand_name, branch_name)
-        if not comp:
-            continue
-        ahead_by = comp.get('ahead_by', 0)
-        behind_by = comp.get('behind_by', 0)
-        status = comp.get('status', '')
-        mb_commit = comp.get('merge_base_commit', {}) or {}
-        mb_sha = mb_commit.get('sha', '')
-        cand_head_sha = branch_map[cand_name].get('commit', {}).get('sha', '')
+    parent_results = {}
+    sorted_branches = sorted(raw_branches, key=lambda b: branch_commit_dates.get(b['name'], datetime.min.replace(tzinfo=timezone.utc)))
 
-        if mb_sha and cand_head_sha and mb_sha == cand_head_sha:
-            if ahead_by < min_ahead:
-                min_ahead = ahead_by
-                best_parent = cand_name
-                best_confidence = 'High'
-                best_reason = f"Branch branched directly off '{cand_name}' (head commit matches merge-base; {ahead_by} commits ahead)."
-        elif mb_sha and ahead_by > 0:
-            if ahead_by < min_ahead:
-                min_ahead = ahead_by
-                best_parent = cand_name
-                best_confidence = 'Medium'
-                best_reason = f"Closest ancestor branch graph proximity to '{cand_name}' ({ahead_by} commits ahead, {behind_by} commits behind)."
-
-    if best_parent:
-        return {
-            'parent': best_parent,
-            'type': 'Inferred',
-            'confidence': best_confidence,
-            'reason': best_reason
-        }
-
-    if branch_name.startswith(('feature/', 'feat/', 'fix/', 'bugfix/')):
-        if 'develop' in branch_map and branch_name != 'develop':
-            return {
-                'parent': 'develop',
-                'type': 'Inferred',
-                'confidence': 'Medium',
-                'reason': "Branch naming convention matches feature/fix pattern; 'develop' exists."
+    for b in sorted_branches:
+        b_name = b['name']
+        if b_name == default_branch:
+            parent_results[b_name] = {
+                'parent': 'None (Default Branch)',
+                'type': 'Recorded',
+                'confidence': 'High',
+                'reason': 'This branch is designated as the repository default branch.'
             }
-        elif default_branch in branch_map:
-            return {
+            continue
+
+        if repo_key in config_overrides and 'branches' in config_overrides[repo_key]:
+            branch_cfg = config_overrides[repo_key]['branches'].get(b_name, {})
+            if 'parent' in branch_cfg:
+                p = branch_cfg['parent']
+                parent_results[b_name] = {
+                    'parent': p,
+                    'type': 'Configured',
+                    'confidence': 'High',
+                    'reason': "Manually configured parent in repository configuration overrides."
+                }
+                continue
+
+        if b_name in pr_base_map:
+            p_ref, pr_num = pr_base_map[b_name]
+            parent_results[b_name] = {
+                'parent': p_ref,
+                'type': 'Pull request based',
+                'confidence': 'High',
+                'reason': f"Declared base branch in Pull Request #{pr_num}."
+            }
+            continue
+
+        best_cand = None
+        min_ahead = float('inf')
+        best_confidence = 'Low'
+        best_reason = ''
+
+        b_dt = branch_commit_dates.get(b_name, datetime.max.replace(tzinfo=timezone.utc))
+
+        for cand_name in branch_map:
+            if cand_name == b_name:
+                continue
+
+            if is_reachable(b_name, cand_name, {k: v['parent'] for k, v in parent_results.items()}):
+                continue
+
+            cand_dt = branch_commit_dates.get(cand_name, datetime.min.replace(tzinfo=timezone.utc))
+
+            if use_local_clone:
+                mb_sha = local_merge_bases.get((cand_name, b_name))
+                cand_head_sha = branch_map[cand_name].get('commit', {}).get('sha', '')
+                if mb_sha and cand_head_sha and mb_sha == cand_head_sha:
+                    if cand_dt <= b_dt or cand_name == default_branch:
+                        best_cand = cand_name
+                        best_confidence = 'High'
+                        best_reason = f"Branched directly off '{cand_name}' (merge-base matches head of '{cand_name}')."
+                        break
+            else:
+                comp = compare_refs(token, owner, repo_name, cand_name, b_name)
+                if not comp:
+                    continue
+                ahead_by = comp.get('ahead_by', 0)
+                behind_by = comp.get('behind_by', 0)
+                mb_commit = comp.get('merge_base_commit', {}) or {}
+                mb_sha = mb_commit.get('sha', '')
+                cand_head_sha = branch_map[cand_name].get('commit', {}).get('sha', '')
+
+                if mb_sha and cand_head_sha and mb_sha == cand_head_sha:
+                    if ahead_by < min_ahead:
+                        min_ahead = ahead_by
+                        best_cand = cand_name
+                        best_confidence = 'High'
+                        best_reason = f"Branched directly off '{cand_name}' (merge-base matches head; {ahead_by} commits ahead)."
+                elif mb_sha and ahead_by > 0 and (cand_dt <= b_dt or cand_name == default_branch):
+                    if ahead_by < min_ahead:
+                        min_ahead = ahead_by
+                        best_cand = cand_name
+                        best_confidence = 'Medium'
+                        best_reason = f"Closest ancestor branch graph proximity to '{cand_name}' ({ahead_by} commits ahead, {behind_by} commits behind)."
+
+        if best_cand:
+            parent_results[b_name] = {
+                'parent': best_cand,
+                'type': 'Inferred',
+                'confidence': best_confidence,
+                'reason': best_reason
+            }
+            continue
+
+        if b_name.startswith(('feature/', 'feat/', 'fix/', 'bugfix/')):
+            if 'develop' in branch_map and b_name != 'develop':
+                parent_results[b_name] = {
+                    'parent': 'develop',
+                    'type': 'Inferred',
+                    'confidence': 'Medium',
+                    'reason': "Branch naming convention matches feature/fix pattern; 'develop' exists."
+                }
+                continue
+            elif default_branch in branch_map:
+                parent_results[b_name] = {
+                    'parent': default_branch,
+                    'type': 'Inferred',
+                    'confidence': 'Low',
+                    'reason': f"Branch naming convention matches feature/fix pattern; falling back to default branch '{default_branch}'."
+                }
+                continue
+
+        if default_branch in branch_map:
+            parent_results[b_name] = {
                 'parent': default_branch,
                 'type': 'Inferred',
                 'confidence': 'Low',
-                'reason': f"Branch naming convention matches feature/fix pattern; falling back to default branch '{default_branch}'."
+                'reason': f"Fallback candidate to default branch '{default_branch}'."
+            }
+        else:
+            parent_results[b_name] = {
+                'parent': 'Unknown',
+                'type': 'Unknown',
+                'confidence': 'Low',
+                'reason': 'Insufficient evidence or disconnected history to determine parent branch.'
             }
 
-    if default_branch in branch_map:
-        return {
-            'parent': default_branch,
-            'type': 'Inferred',
-            'confidence': 'Low',
-            'reason': f"Fallback candidate to default branch '{default_branch}'."
-        }
-
-    return {
-        'parent': 'Unknown',
-        'type': 'Unknown',
-        'confidence': 'Low',
-        'reason': 'Insufficient evidence or disconnected history to determine parent branch.'
-    }
+    return parent_results
 
 def classify_activity(commit_dt_utc, now_dt_utc):
     if not commit_dt_utc:
@@ -508,21 +610,16 @@ def build_topology_tree(branches_data, default_branch):
 
 def build_mermaid_graph(branches_data, default_branch):
     lines = ["```mermaid", "graph TD"]
-    node_ids = {b['name']: f"node_{idx}" for idx, b in enumerate(branches_data)}
-
     for b in branches_data:
         b_name = b['name']
-        nid = node_ids[b_name]
         is_def = " (Default)" if b_name == default_branch else ""
-        lines.append(f'    {nid}["{b_name}{is_def}"]')
+        lines.append(f'    "{b_name}{is_def}"')
 
     for b in branches_data:
         child_name = b['name']
         parent_name = b['parent_info']['parent']
-        if parent_name in node_ids and parent_name != child_name:
-            p_id = node_ids[parent_name]
-            c_id = node_ids[child_name]
-            lines.append(f"    {p_id} --> {c_id}")
+        if parent_name and parent_name not in ('None (Default Branch)', 'Unknown') and parent_name != child_name:
+            lines.append(f'    "{parent_name}" --> "{child_name}"')
 
     lines.append("```")
     return "\n".join(lines)
@@ -652,6 +749,7 @@ def process_single_repository(repo, token, drive_service, day_folder_id, config_
     full_name = repo['full_name']
     owner = repo.get('owner', {}).get('login', SRC_GH_OWNER)
     default_branch = repo.get('default_branch') or 'main'
+    clone_url = repo.get('clone_url', '')
 
     log.log(f"Processing repository '{full_name}' (ID: {repo_id})...")
     now_dt_utc = datetime.now(timezone.utc)
@@ -659,6 +757,8 @@ def process_single_repository(repo, token, drive_service, day_folder_id, config_
     raw_branches = get_repo_branches(token, owner, repo_name)
     open_prs = get_repo_pull_requests(token, owner, repo_name, state='open')
     all_prs = get_repo_pull_requests(token, owner, repo_name, state='all')
+
+    parent_map = resolve_all_parent_branches(token, owner, repo_name, default_branch, raw_branches, all_prs, config_overrides, clone_url=clone_url)
 
     branches_data = []
     for b in raw_branches:
@@ -707,7 +807,13 @@ def process_single_repository(repo, token, drive_service, day_folder_id, config_
                 if ahead_by == 0:
                     merged = True
 
-        parent_info = determine_parent_branch(token, owner, repo_name, b_name, default_branch, raw_branches, all_prs, config_overrides)
+        parent_info = parent_map.get(b_name, {
+            'parent': 'Unknown',
+            'type': 'Unknown',
+            'confidence': 'Low',
+            'reason': 'Could not resolve parent.'
+        })
+
         activity = classify_activity(commit_dt_utc, now_dt_utc)
 
         branch_url = f"https://github.com/{full_name}/tree/{b_name}"
