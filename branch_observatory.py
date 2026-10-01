@@ -31,11 +31,13 @@ STATE_FILE = Path(env('BRANCH_OBSERVATORY_STATE', default='branch_observatory_st
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='branch_observatory_summary.txt'))
 STALE_DAYS_THRESHOLD = int(env('STALE_DAYS', default='30'))
 VERY_STALE_DAYS_THRESHOLD = int(env('VERY_STALE_DAYS', default='90'))
-MAX_RETRIES = int(env('MAX_RETRIES', default='3'))
-RETRY_BASE_DELAY = float(env('RETRY_BASE_DELAY', default='3.0'))
-MAX_API_BRANCHES = int(env('MAX_API_BRANCHES', default='20'))
+MAX_RETRIES = int(env('MAX_RETRIES', default='5'))
+RETRY_BASE_DELAY = float(env('RETRY_BASE_DELAY', default='5.0'))
+MAX_API_BRANCHES = int(env('MAX_API_BRANCHES', default='15'))
 
 _SECRET_LIST = [s for s in [SRC_GH_TOKEN, GDRIVE_SA_JSON] if s]
+_drive_shared_drive_id = None
+_drive_shared_drive_id_resolved = False
 
 def redact(text: str) -> str:
     text_str = str(text)
@@ -97,7 +99,7 @@ def with_retry(func, description: str, max_retries: int = MAX_RETRIES, base_dela
         except Exception as e:
             last_error = e
             if attempt < max_retries:
-                delay = base_delay * attempt
+                delay = base_delay * (2 ** (attempt - 1))
                 log.log(f"Versuch {attempt}/{max_retries} failed for '{description}': {e} - retry in {delay:.0f}s")
                 time.sleep(delay)
             else:
@@ -106,11 +108,11 @@ def with_retry(func, description: str, max_retries: int = MAX_RETRIES, base_dela
 
 def _check_rate_limit(response):
     remaining = response.headers.get('X-RateLimit-Remaining')
-    if remaining is not None and int(remaining) < 10:
+    if remaining is not None and int(remaining) < 20:
         reset_time = response.headers.get('X-RateLimit-Reset')
         if reset_time:
-            wait_time = max(1.0, float(reset_time) - time.time() + 1.0)
-            if wait_time < 120:
+            wait_time = max(2.0, float(reset_time) - time.time() + 2.0)
+            if wait_time < 180:
                 log.log(f"Rate limit low ({remaining} remaining), pausing for {wait_time:.0f}s")
                 time.sleep(wait_time)
 
@@ -126,10 +128,17 @@ def http_gh_request(method, url, token, params=None, json_body=None):
         r = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=30)
         _check_rate_limit(r)
         if r.status_code in (408, 409, 425, 429) or r.status_code >= 500:
+            retry_after = r.headers.get('Retry-After')
+            wait_sec = float(retry_after) if retry_after else 10.0
+            time.sleep(wait_sec)
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
         if r.status_code == 403:
             body_text = r.text.lower()
-            if 'secondary rate limit' in body_text or 'abuse detection' in body_text:
+            if 'secondary rate limit' in body_text or 'abuse detection' in body_text or 'rate limit' in body_text:
+                retry_after = r.headers.get('Retry-After')
+                wait_sec = float(retry_after) if retry_after else 60.0
+                log.log(f"Secondary rate limit hit on GitHub API. Pausing for {wait_sec:.0f}s...")
+                time.sleep(wait_sec)
                 raise RuntimeError(f"Secondary rate limit HTTP 403: {r.text[:200]}")
         return r
 
@@ -200,19 +209,18 @@ def get_repo_pull_requests(token, owner, repo_name, state='all'):
                 break
     return prs
 
-def compare_refs(token, owner, repo_name, base, head):
+def compare_refs(token, owner, repo_name, base, head, compare_cache=None):
+    if compare_cache is not None and (base, head) in compare_cache:
+        return compare_cache[(base, head)]
+
     url = f'https://api.github.com/repos/{owner}/{repo_name}/compare/{base}...{head}'
     r = http_gh_request('GET', url, token)
     if r.status_code == 200:
-        return r.json()
+        res = r.json()
+        if compare_cache is not None:
+            compare_cache[(base, head)] = res
+        return res
     return None
-
-def get_branch_protection(token, owner, repo_name, branch_name):
-    url = f'https://api.github.com/repos/{owner}/{repo_name}/branches/{branch_name}/protection'
-    r = http_gh_request('GET', url, token)
-    if r.status_code == 200:
-        return True, r.json()
-    return False, None
 
 def load_config(config_path):
     if not os.path.exists(config_path):
@@ -252,7 +260,21 @@ def get_drive_service(sa_json_str):
     )
     return build('drive', 'v3', credentials=creds)
 
-def list_drive_files(service, query: str):
+def get_shared_drive_id(service, parent_id=None):
+    global _drive_shared_drive_id, _drive_shared_drive_id_resolved
+    if _drive_shared_drive_id_resolved:
+        return _drive_shared_drive_id
+    target_id = parent_id or GDRIVE_FOLDER_ID
+    if target_id:
+        try:
+            info = with_retry(lambda: service.files().get(fileId=target_id, supportsAllDrives=True, fields='driveId').execute(), 'Shared-Drive-ID ermitteln')
+            _drive_shared_drive_id = info.get('driveId')
+        except Exception:
+            _drive_shared_drive_id = None
+    _drive_shared_drive_id_resolved = True
+    return _drive_shared_drive_id
+
+def list_drive_files(service, query: str, parent_id=None):
     results = []
     page_token = None
     while True:
@@ -263,6 +285,10 @@ def list_drive_files(service, query: str):
             'includeItemsFromAllDrives': True,
             'pageSize': 100
         }
+        drive_id = get_shared_drive_id(service, parent_id)
+        if drive_id:
+            kwargs['corpora'] = 'drive'
+            kwargs['driveId'] = drive_id
         if page_token:
             kwargs['pageToken'] = page_token
         res = with_retry(lambda kwargs=kwargs: service.files().list(**kwargs).execute(), 'Drive-Suche')
@@ -277,23 +303,25 @@ def get_or_create_folder(service, folder_name: str, parent_id: str = None) -> st
         q = f"name = '{folder_name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     else:
         q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    files = list_drive_files(service, q)
-    if files:
-        return files[0]['id']
-    meta = {
+    existing = list_drive_files(service, q, parent_id=parent_id)
+    if existing:
+        existing.sort(key=lambda f: f.get('createdTime', ''))
+        return existing[0]['id']
+
+    body = {
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder'
     }
     if parent_id:
-        meta['parents'] = [parent_id]
-    f = with_retry(lambda: service.files().create(body=meta, fields='id', supportsAllDrives=True).execute(), f"Ordner '{folder_name}' anlegen")
+        body['parents'] = [parent_id]
+    f = with_retry(lambda: service.files().create(body=body, fields='id', supportsAllDrives=True).execute(), f"Ordner '{folder_name}' anlegen")
     return f['id']
 
 def upload_or_update_file(service, folder_id: str, file_name: str, content_str: str, repo_id: str = None, mimetype: str = 'text/plain') -> str:
     from googleapiclient.http import MediaIoBaseUpload
 
     q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
-    existing = list_drive_files(service, q)
+    existing = list_drive_files(service, q, parent_id=folder_id)
     media = MediaIoBaseUpload(io.BytesIO(content_str.encode('utf-8')), mimetype=mimetype, resumable=True)
 
     app_props = {}
@@ -379,21 +407,20 @@ def is_reachable(parent, child, parent_map):
 def resolve_all_parent_branches(token, owner, repo_name, default_branch, raw_branches, all_prs, config_overrides, clone_url=''):
     branch_map = {b['name']: b for b in raw_branches}
     repo_key = f"{owner}/{repo_name}"
+    compare_cache = {}
 
     branch_commit_dates = {}
     for b in raw_branches:
         b_name = b['name']
-        sha = b.get('commit', {}).get('sha', '')
+        commit_obj = b.get('commit', {}) or {}
+        sha = commit_obj.get('sha', '')
         dt = datetime.min.replace(tzinfo=timezone.utc)
-        if sha:
-            c_detail = http_gh_request('GET', f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}", token)
-            if c_detail.status_code == 200:
-                d_raw = c_detail.json().get('commit', {}).get('committer', {}).get('date')
-                if d_raw:
-                    try:
-                        dt = datetime.strptime(d_raw, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-                    except Exception:
-                        pass
+        committer_dt = commit_obj.get('commit', {}).get('committer', {}).get('date')
+        if committer_dt:
+            try:
+                dt = datetime.strptime(committer_dt, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
         branch_commit_dates[b_name] = dt
 
     pr_base_map = {}
@@ -471,7 +498,7 @@ def resolve_all_parent_branches(token, owner, repo_name, default_branch, raw_bra
                         best_reason = f"Branched directly off '{cand_name}' (merge-base matches head of '{cand_name}')."
                         break
             else:
-                comp = compare_refs(token, owner, repo_name, cand_name, b_name)
+                comp = compare_refs(token, owner, repo_name, cand_name, b_name, compare_cache=compare_cache)
                 if not comp:
                     continue
                 ahead_by = comp.get('ahead_by', 0)
@@ -799,7 +826,7 @@ def process_single_repository(repo, token, drive_service, day_folder_id, config_
     branches_data = []
     for b in raw_branches:
         b_name = b['name']
-        commit_obj = b.get('commit', {})
+        commit_obj = b.get('commit', {}) or {}
         sha = commit_obj.get('sha', '')
         sha_short = sha[:7] if sha else 'unknown'
 
@@ -808,29 +835,22 @@ def process_single_repository(repo, token, drive_service, day_folder_id, config_
         author_name = 'Unknown'
         commit_msg = ''
 
-        if sha:
-            commit_detail = http_gh_request('GET', f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}", token)
-            if commit_detail.status_code == 200:
-                c_json = commit_detail.json()
-                c_info = c_json.get('commit', {})
-                committer_info = c_info.get('committer', {}) or c_info.get('author', {})
-                date_raw = committer_info.get('date')
-                if date_raw:
-                    try:
-                        commit_dt_utc = datetime.strptime(date_raw, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-                        commit_date_str = commit_dt_utc.strftime('%Y-%m-%d %H:%M UTC')
-                    except Exception:
-                        commit_date_str = str(date_raw)
+        c_info = commit_obj.get('commit', {})
+        if c_info:
+            committer_info = c_info.get('committer', {}) or c_info.get('author', {})
+            date_raw = committer_info.get('date')
+            if date_raw:
+                try:
+                    commit_dt_utc = datetime.strptime(date_raw, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+                    commit_date_str = commit_dt_utc.strftime('%Y-%m-%d %H:%M UTC')
+                except Exception:
+                    commit_date_str = str(date_raw)
 
-                author_raw = c_info.get('author', {}).get('name') or committer_info.get('name') or 'Unknown'
-                author_name = sanitize_author_name(author_raw)
-                commit_msg = sanitize_commit_message(c_info.get('message', ''))
+            author_raw = c_info.get('author', {}).get('name') or committer_info.get('name') or 'Unknown'
+            author_name = sanitize_author_name(author_raw)
+            commit_msg = sanitize_commit_message(c_info.get('message', ''))
 
         is_protected = b.get('protected', False)
-        if not is_protected:
-            has_prot, _ = get_branch_protection(token, owner, repo_name, b_name)
-            is_protected = has_prot
-
         is_default = (b_name == default_branch)
         ahead_by, behind_by = 0, 0
         merged = False
