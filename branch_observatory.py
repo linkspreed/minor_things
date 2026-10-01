@@ -653,7 +653,7 @@ def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt
     report.append("================================================================================")
     return "\n".join(report)
 
-def process_single_repository(repo, token, drive_service, root_observatory_folder_id, config_overrides, state_data, run_url, dry_run=False):
+def process_single_repository(repo, token, drive_service, day_folder_id, config_overrides, state_data, run_url, dry_run=False):
     repo_id = str(repo['id'])
     repo_name = repo['name']
     full_name = repo['full_name']
@@ -752,7 +752,7 @@ def process_single_repository(repo, token, drive_service, root_observatory_folde
         log.log(f"[DRY RUN] Would process and upload reports for '{full_name}'")
         return True, "Updated successfully"
 
-    repo_folder_id = get_or_create_folder(drive_service, repo_name, root_observatory_folder_id)
+    repo_folder_id = get_or_create_folder(drive_service, repo_name, day_folder_id)
 
     txt_filename = f"{repo_name}_branch_topology.txt"
     md_filename = f"{repo_name}_branch_topology.md"
@@ -780,6 +780,11 @@ def main():
 
     dry_run_mode = args.dry_run or env('DRY_RUN', default='false').lower() == 'true'
 
+    now_dt_utc = datetime.now(timezone.utc)
+    year_str = now_dt_utc.strftime('%Y')
+    month_str = now_dt_utc.strftime('%B')
+    day_str = now_dt_utc.strftime('%d')
+
     log.log("===== Branch Observatory Started =====")
     if dry_run_mode:
         log.log("Running in DRY RUN mode. No external changes will be performed.")
@@ -789,14 +794,17 @@ def main():
         sys.exit(1)
 
     drive_service = None
-    root_observatory_folder_id = None
+    day_folder_id = None
 
     if GDRIVE_SA_JSON:
         try:
             drive_service = get_drive_service(GDRIVE_SA_JSON)
             root_parent = GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else None
             root_observatory_folder_id = get_or_create_folder(drive_service, GDRIVE_OBSERVATORY_FOLDER_NAME, root_parent)
-            log.log(f"Target Google Drive Root Folder ID: {root_observatory_folder_id}")
+            year_folder_id = get_or_create_folder(drive_service, year_str, root_observatory_folder_id)
+            month_folder_id = get_or_create_folder(drive_service, month_str, year_folder_id)
+            day_folder_id = get_or_create_folder(drive_service, day_str, month_folder_id)
+            log.log(f"Target Google Drive Day Folder ID: {day_folder_id}")
         except Exception as e:
             log.log(f"CRITICAL ERROR initializing Google Services: {e}")
             sys.exit(1)
@@ -825,7 +833,7 @@ def main():
         try:
             ok, msg = process_single_repository(
                 repo, SRC_GH_TOKEN, drive_service,
-                root_observatory_folder_id, config_overrides, state_data, run_url, dry_run=dry_run_mode
+                day_folder_id, config_overrides, state_data, run_url, dry_run=dry_run_mode
             )
             if ok:
                 if msg == "No change required":
