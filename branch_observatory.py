@@ -349,14 +349,14 @@ def determine_parent_branch(token, owner, repo_name, branch_name, default_branch
                 'parent': p,
                 'type': 'Configured',
                 'confidence': 'High',
-                'reason': f"Manually configured parent in repository configuration overrides."
+                'reason': "Manually configured parent in repository configuration overrides."
             }
 
     for pr in prs:
         head_ref = pr.get('head', {}).get('ref')
         if head_ref == branch_name:
             base_ref = pr.get('base', {}).get('ref')
-            if base_ref and base_ref in branch_map:
+            if base_ref and base_ref in branch_map and base_ref != branch_name:
                 pr_num = pr.get('number')
                 return {
                     'parent': base_ref,
@@ -365,46 +365,44 @@ def determine_parent_branch(token, owner, repo_name, branch_name, default_branch
                     'reason': f"Declared base branch in Pull Request #{pr_num} ({pr.get('state', 'open')})."
                 }
 
-    candidate_bases = []
-    if 'develop' in branch_map and branch_name != 'develop':
-        candidate_bases.append('develop')
-    if default_branch in branch_map and default_branch not in candidate_bases:
-        candidate_bases.append(default_branch)
-    for b in branch_map:
-        if b.startswith('release/') and b not in candidate_bases and b != branch_name:
-            candidate_bases.append(b)
+    best_parent = None
+    min_ahead = float('inf')
+    best_confidence = 'Low'
+    best_reason = ''
 
-    for base in candidate_bases:
-        comp = compare_refs(token, owner, repo_name, base, branch_name)
-        if comp:
-            behind_by = comp.get('behind_by', 0)
-            ahead_by = comp.get('ahead_by', 0)
-            status = comp.get('status', '')
-            mb_commit = comp.get('merge_base_commit', {}) or {}
-            mb_sha = mb_commit.get('sha', '')
-            base_head_sha = branch_map.get(base, {}).get('commit', {}).get('sha', '')
+    for cand_name in branch_map:
+        if cand_name == branch_name:
+            continue
+        comp = compare_refs(token, owner, repo_name, cand_name, branch_name)
+        if not comp:
+            continue
+        ahead_by = comp.get('ahead_by', 0)
+        behind_by = comp.get('behind_by', 0)
+        status = comp.get('status', '')
+        mb_commit = comp.get('merge_base_commit', {}) or {}
+        mb_sha = mb_commit.get('sha', '')
+        cand_head_sha = branch_map[cand_name].get('commit', {}).get('sha', '')
 
-            if status in ('ahead', 'identical') or (ahead_by > 0 and behind_by == 0):
-                return {
-                    'parent': base,
-                    'type': 'Inferred',
-                    'confidence': 'High' if status == 'identical' or behind_by == 0 else 'Medium',
-                    'reason': f"Merge-base analysis against '{base}' shows status '{status}' (ahead: {ahead_by}, behind: {behind_by})."
-                }
-            elif mb_sha and base_head_sha and mb_sha == base_head_sha:
-                return {
-                    'parent': base,
-                    'type': 'Inferred',
-                    'confidence': 'High',
-                    'reason': f"Merge-base commit matches head of '{base}' (ahead: {ahead_by}, behind: {behind_by})."
-                }
-            elif mb_sha:
-                return {
-                    'parent': base,
-                    'type': 'Inferred',
-                    'confidence': 'Medium',
-                    'reason': f"Shares merge-base with '{base}' (status: {status}, ahead: {ahead_by}, behind: {behind_by})."
-                }
+        if mb_sha and cand_head_sha and mb_sha == cand_head_sha:
+            if ahead_by < min_ahead:
+                min_ahead = ahead_by
+                best_parent = cand_name
+                best_confidence = 'High'
+                best_reason = f"Branch branched directly off '{cand_name}' (head commit matches merge-base; {ahead_by} commits ahead)."
+        elif mb_sha and ahead_by > 0:
+            if ahead_by < min_ahead:
+                min_ahead = ahead_by
+                best_parent = cand_name
+                best_confidence = 'Medium'
+                best_reason = f"Closest ancestor branch graph proximity to '{cand_name}' ({ahead_by} commits ahead, {behind_by} commits behind)."
+
+    if best_parent:
+        return {
+            'parent': best_parent,
+            'type': 'Inferred',
+            'confidence': best_confidence,
+            'reason': best_reason
+        }
 
     if branch_name.startswith(('feature/', 'feat/', 'fix/', 'bugfix/')):
         if 'develop' in branch_map and branch_name != 'develop':
@@ -412,7 +410,7 @@ def determine_parent_branch(token, owner, repo_name, branch_name, default_branch
                 'parent': 'develop',
                 'type': 'Inferred',
                 'confidence': 'Medium',
-                'reason': f"Branch naming convention matches feature/fix pattern; 'develop' exists."
+                'reason': "Branch naming convention matches feature/fix pattern; 'develop' exists."
             }
         elif default_branch in branch_map:
             return {
@@ -422,23 +420,13 @@ def determine_parent_branch(token, owner, repo_name, branch_name, default_branch
                 'reason': f"Branch naming convention matches feature/fix pattern; falling back to default branch '{default_branch}'."
             }
 
-    if branch_name.startswith(('hotfix/', 'release/')) and default_branch in branch_map:
+    if default_branch in branch_map:
         return {
             'parent': default_branch,
             'type': 'Inferred',
-            'confidence': 'Medium',
-            'reason': f"Branch naming convention matches release/hotfix pattern targeting default branch '{default_branch}'."
+            'confidence': 'Low',
+            'reason': f"Fallback candidate to default branch '{default_branch}'."
         }
-
-    if default_branch in branch_map:
-        comp = compare_refs(token, owner, repo_name, default_branch, branch_name)
-        if comp and comp.get('merge_base_commit'):
-            return {
-                'parent': default_branch,
-                'type': 'Inferred',
-                'confidence': 'Low',
-                'reason': f"Fallback candidate; shares merge-base commit with default branch '{default_branch}'."
-            }
 
     return {
         'parent': 'Unknown',
@@ -520,16 +508,21 @@ def build_topology_tree(branches_data, default_branch):
 
 def build_mermaid_graph(branches_data, default_branch):
     lines = ["```mermaid", "graph TD"]
+    node_ids = {b['name']: f"node_{idx}" for idx, b in enumerate(branches_data)}
+
+    for b in branches_data:
+        b_name = b['name']
+        nid = node_ids[b_name]
+        is_def = " (Default)" if b_name == default_branch else ""
+        lines.append(f'    {nid}["{b_name}{is_def}"]')
+
     for b in branches_data:
         child_name = b['name']
         parent_name = b['parent_info']['parent']
-        if parent_name and parent_name not in ('None (Default Branch)', 'Unknown'):
-            safe_parent = re.sub(r'[^a-zA-Z0-9_\-]', '_', parent_name)
-            safe_child = re.sub(r'[^a-zA-Z0-9_\-]', '_', child_name)
-            lines.append(f"    {safe_parent}[\"{parent_name}\"] --> {safe_child}[\"{child_name}\"]")
-        elif child_name == default_branch:
-            safe_child = re.sub(r'[^a-zA-Z0-9_\-]', '_', child_name)
-            lines.append(f"    {safe_child}[\"{child_name} (Default)\"]")
+        if parent_name in node_ids and parent_name != child_name:
+            p_id = node_ids[parent_name]
+            c_id = node_ids[child_name]
+            lines.append(f"    {p_id} --> {c_id}")
 
     lines.append("```")
     return "\n".join(lines)
