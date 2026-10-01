@@ -36,6 +36,8 @@ RETRY_BASE_DELAY = float(env('RETRY_BASE_DELAY', default='3.0'))
 MAX_API_BRANCHES = int(env('MAX_API_BRANCHES', default='20'))
 
 _SECRET_LIST = [s for s in [SRC_GH_TOKEN, GDRIVE_SA_JSON] if s]
+_drive_shared_drive_id = None
+_drive_shared_drive_id_resolved = False
 
 def redact(text: str) -> str:
     text_str = str(text)
@@ -252,7 +254,21 @@ def get_drive_service(sa_json_str):
     )
     return build('drive', 'v3', credentials=creds)
 
-def list_drive_files(service, query: str):
+def get_shared_drive_id(service, parent_id=None):
+    global _drive_shared_drive_id, _drive_shared_drive_id_resolved
+    if _drive_shared_drive_id_resolved:
+        return _drive_shared_drive_id
+    target_id = parent_id or GDRIVE_FOLDER_ID
+    if target_id:
+        try:
+            info = with_retry(lambda: service.files().get(fileId=target_id, supportsAllDrives=True, fields='driveId').execute(), 'Shared-Drive-ID ermitteln')
+            _drive_shared_drive_id = info.get('driveId')
+        except Exception:
+            _drive_shared_drive_id = None
+    _drive_shared_drive_id_resolved = True
+    return _drive_shared_drive_id
+
+def list_drive_files(service, query: str, parent_id=None):
     results = []
     page_token = None
     while True:
@@ -263,6 +279,10 @@ def list_drive_files(service, query: str):
             'includeItemsFromAllDrives': True,
             'pageSize': 100
         }
+        drive_id = get_shared_drive_id(service, parent_id)
+        if drive_id:
+            kwargs['corpora'] = 'drive'
+            kwargs['driveId'] = drive_id
         if page_token:
             kwargs['pageToken'] = page_token
         res = with_retry(lambda kwargs=kwargs: service.files().list(**kwargs).execute(), 'Drive-Suche')
@@ -277,23 +297,25 @@ def get_or_create_folder(service, folder_name: str, parent_id: str = None) -> st
         q = f"name = '{folder_name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     else:
         q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    files = list_drive_files(service, q)
-    if files:
-        return files[0]['id']
-    meta = {
+    existing = list_drive_files(service, q, parent_id=parent_id)
+    if existing:
+        existing.sort(key=lambda f: f.get('createdTime', ''))
+        return existing[0]['id']
+
+    body = {
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder'
     }
     if parent_id:
-        meta['parents'] = [parent_id]
-    f = with_retry(lambda: service.files().create(body=meta, fields='id', supportsAllDrives=True).execute(), f"Ordner '{folder_name}' anlegen")
+        body['parents'] = [parent_id]
+    f = with_retry(lambda: service.files().create(body=body, fields='id', supportsAllDrives=True).execute(), f"Ordner '{folder_name}' anlegen")
     return f['id']
 
 def upload_or_update_file(service, folder_id: str, file_name: str, content_str: str, repo_id: str = None, mimetype: str = 'text/plain') -> str:
     from googleapiclient.http import MediaIoBaseUpload
 
     q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
-    existing = list_drive_files(service, q)
+    existing = list_drive_files(service, q, parent_id=folder_id)
     media = MediaIoBaseUpload(io.BytesIO(content_str.encode('utf-8')), mimetype=mimetype, resumable=True)
 
     app_props = {}
