@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -21,7 +22,7 @@ SRC_GH_OWNER = env('SRC_GH_OWNER')
 SRC_GH_OWNER_TYPE = env('SRC_GH_OWNER_TYPE', default='user')
 GDRIVE_SA_JSON = env('GDRIVE_SA_JSON')
 GDRIVE_FOLDER_ID = env('GDRIVE_FOLDER_ID')
-GDRIVE_OBSERVATORY_FOLDER_NAME = env('GDRIVE_OBSERVATORY_FOLDER_NAME', default='GitHub Branch Observatory')
+GDRIVE_OBSERVATORY_FOLDER_NAME = env('GDRIVE_OBSERVATORY_FOLDER_NAME', default='Branch_Observatory')
 CONFIG_FILE = env('BRANCH_OBSERVATORY_CONFIG', default='branch_observatory_config.yml')
 STATE_FILE = Path(env('BRANCH_OBSERVATORY_STATE', default='branch_observatory_state.json'))
 SUMMARY_FILE = Path(env('EMAIL_SUMMARY_FILE', default='branch_observatory_summary.txt'))
@@ -237,176 +238,97 @@ def save_state(state_path: Path, state_data: dict):
     except Exception as e:
         log.log(f"Failed to save state file: {e}")
 
-def get_google_services(sa_json_str):
+def get_drive_service(sa_json_str):
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     info = json.loads(sa_json_str)
     creds = service_account.Credentials.from_service_account_info(
         info,
-        scopes=[
-            'https://www.googleapis.com/auth/drive',
-            'https://www.googleapis.com/auth/documents'
-        ]
+        scopes=['https://www.googleapis.com/auth/drive']
     )
-    drive_service = build('drive', 'v3', credentials=creds)
-    docs_service = build('docs', 'v1', credentials=creds)
-    return drive_service, docs_service
+    return build('drive', 'v3', credentials=creds)
 
-def resolve_or_create_drive_folder(drive_service, parent_folder_id, folder_name, dry_run=False):
-    if parent_folder_id:
-        query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and '{parent_folder_id}' in parents and trashed = false"
+def list_drive_files(service, query: str):
+    results = []
+    page_token = None
+    while True:
+        kwargs = {
+            'q': query,
+            'fields': 'nextPageToken, files(id, name, createdTime, webViewLink, appProperties)',
+            'supportsAllDrives': True,
+            'includeItemsFromAllDrives': True,
+            'pageSize': 100
+        }
+        if page_token:
+            kwargs['pageToken'] = page_token
+        res = with_retry(lambda kwargs=kwargs: service.files().list(**kwargs).execute(), 'Drive-Suche')
+        results.extend(res.get('files', []))
+        page_token = res.get('nextPageToken')
+        if not page_token:
+            break
+    return results
+
+def get_or_create_folder(service, folder_name: str, parent_id: str = None) -> str:
+    if parent_id:
+        q = f"name = '{folder_name}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     else:
-        query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
-
-    res = with_retry(
-        lambda: drive_service.files().list(
-            q=query,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageSize=10,
-            fields='files(id, name, createdTime)'
-        ).execute(),
-        f"Search for folder '{folder_name}'"
-    )
-    files = res.get('files', [])
+        q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    files = list_drive_files(service, q)
     if files:
-        files.sort(key=lambda x: x.get('createdTime', ''))
         return files[0]['id']
-
-    if dry_run:
-        log.log(f"[DRY RUN] Would create Google Drive folder '{folder_name}'")
-        return 'dry-run-folder-id'
-
-    body = {
+    meta = {
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder'
     }
-    if parent_folder_id:
-        body['parents'] = [parent_folder_id]
+    if parent_id:
+        meta['parents'] = [parent_id]
+    f = with_retry(lambda: service.files().create(body=meta, fields='id', supportsAllDrives=True).execute(), f"Ordner '{folder_name}' anlegen")
+    return f['id']
 
-    folder = with_retry(
-        lambda: drive_service.files().create(body=body, supportsAllDrives=True, fields='id').execute(),
-        f"Create Google Drive folder '{folder_name}'"
-    )
-    return folder['id']
+def upload_or_update_file(service, folder_id: str, file_name: str, content_str: str, repo_id: str = None, mimetype: str = 'text/plain') -> str:
+    from googleapiclient.http import MediaIoBaseUpload
 
-def find_document_by_repo_id(drive_service, repo_id: str):
-    query = f"appProperties has {{ key='github_repo_id' and value='{repo_id}' }} and trashed = false"
-    res = with_retry(
-        lambda: drive_service.files().list(
-            q=query,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-            pageSize=10,
-            fields='files(id, name, appProperties, parents)'
-        ).execute(),
-        f"Search document for repo ID '{repo_id}'"
-    )
-    files = res.get('files', [])
-    if files:
-        return files[0]
-    return None
+    q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
+    existing = list_drive_files(service, q)
+    media = MediaIoBaseUpload(io.BytesIO(content_str.encode('utf-8')), mimetype=mimetype, resumable=True)
 
-def create_google_doc_for_repo(drive_service, folder_id: str, repo_id: str, doc_name: str, dry_run=False):
-    if dry_run:
-        log.log(f"[DRY RUN] Would create Google Doc '{doc_name}' with github_repo_id='{repo_id}' in folder '{folder_id}'")
-        return f"dry-run-doc-id-{repo_id}"
+    app_props = {}
+    if repo_id:
+        app_props['github_repo_id'] = str(repo_id)
 
-    body = {
-        'name': doc_name,
-        'mimeType': 'application/vnd.google-apps.document',
-        'parents': [folder_id],
-        'appProperties': {
-            'github_repo_id': str(repo_id)
+    if existing:
+        file_id = existing[0]['id']
+        body = {}
+        if app_props:
+            body['appProperties'] = app_props
+        res = with_retry(
+            lambda: service.files().update(
+                fileId=file_id,
+                body=body,
+                media_body=media,
+                fields='id, webViewLink',
+                supportsAllDrives=True
+            ).execute(),
+            f"Datei '{file_name}' aktualisieren"
+        )
+        return res.get('id', '')
+    else:
+        meta = {
+            'name': file_name,
+            'parents': [folder_id]
         }
-    }
-    doc_file = with_retry(
-        lambda: drive_service.files().create(body=body, supportsAllDrives=True, fields='id, name, appProperties').execute(),
-        f"Create Google Doc for repo ID {repo_id}"
-    )
-    return doc_file['id']
-
-def update_google_doc_metadata(drive_service, doc_id: str, new_name: str = None, report_hash: str = None, dry_run=False):
-    if dry_run:
-        log.log(f"[DRY RUN] Would update Google Doc ID '{doc_id}' metadata (name={new_name}, hash={report_hash})")
-        return
-    body = {}
-    if new_name:
-        body['name'] = new_name
-    if report_hash:
-        body['appProperties'] = {'last_report_hash': report_hash}
-
-    if body:
-        with_retry(
-            lambda: drive_service.files().update(fileId=doc_id, body=body, supportsAllDrives=True).execute(),
-            f"Update document metadata for {doc_id}"
+        if app_props:
+            meta['appProperties'] = app_props
+        res = with_retry(
+            lambda: service.files().create(
+                body=meta,
+                media_body=media,
+                fields='id, webViewLink',
+                supportsAllDrives=True
+            ).execute(),
+            f"Datei '{file_name}' hochladen"
         )
-
-def get_existing_doc_text_content(docs_service, doc_id: str):
-    try:
-        doc = with_retry(
-            lambda: docs_service.documents().get(documentId=doc_id).execute(),
-            f"Get document text content for {doc_id}"
-        )
-        body_content = doc.get('body', {}).get('content', [])
-        text_parts = []
-        for elem in body_content:
-            p = elem.get('paragraph')
-            if p:
-                for pe in p.get('elements', []):
-                    tr = pe.get('textRun')
-                    if tr and tr.get('content'):
-                        text_parts.append(tr.get('content'))
-        return "".join(text_parts).strip(), doc
-    except Exception as e:
-        log.log(f"Failed to read existing doc content for {doc_id}: {e}")
-        return None, None
-
-def overwrite_google_doc_content(docs_service, doc_id: str, new_content: str, existing_doc_obj=None, dry_run=False):
-    if dry_run:
-        log.log(f"[DRY RUN] Would overwrite Google Doc ID '{doc_id}' content ({len(new_content)} chars)")
-        return True
-
-    doc = existing_doc_obj
-    if not doc:
-        doc = with_retry(
-            lambda: docs_service.documents().get(documentId=doc_id).execute(),
-            f"Get document {doc_id}"
-        )
-
-    body_content = doc.get('body', {}).get('content', [])
-    end_index = 1
-    if body_content:
-        end_index = body_content[-1].get('endIndex', 1)
-
-    requests_batch = []
-    if end_index > 2:
-        requests_batch.append({
-            'deleteContentRange': {
-                'range': {
-                    'startIndex': 1,
-                    'endIndex': end_index - 1
-                }
-            }
-        })
-
-    requests_batch.append({
-        'insertText': {
-            'location': {
-                'index': 1
-            },
-            'text': new_content
-        }
-    })
-
-    with_retry(
-        lambda: docs_service.documents().batchUpdate(
-            documentId=doc_id,
-            body={'requests': requests_batch}
-        ).execute(),
-        f"Batch update document content for {doc_id}"
-    )
-    return True
+        return res.get('id', '')
 
 def determine_parent_branch(token, owner, repo_name, branch_name, default_branch, all_branches, prs, config_overrides):
     branch_map = {b['name']: b for b in all_branches}
@@ -596,6 +518,22 @@ def build_topology_tree(branches_data, default_branch):
 
     return "\n".join(lines)
 
+def build_mermaid_graph(branches_data, default_branch):
+    lines = ["```mermaid", "graph TD"]
+    for b in branches_data:
+        child_name = b['name']
+        parent_name = b['parent_info']['parent']
+        if parent_name and parent_name not in ('None (Default Branch)', 'Unknown'):
+            safe_parent = re.sub(r'[^a-zA-Z0-9_\-]', '_', parent_name)
+            safe_child = re.sub(r'[^a-zA-Z0-9_\-]', '_', child_name)
+            lines.append(f"    {safe_parent}[\"{parent_name}\"] --> {safe_child}[\"{child_name}\"]")
+        elif child_name == default_branch:
+            safe_child = re.sub(r'[^a-zA-Z0-9_\-]', '_', child_name)
+            lines.append(f"    {safe_child}[\"{child_name} (Default)\"]")
+
+    lines.append("```")
+    return "\n".join(lines)
+
 def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt_utc):
     repo_id = str(repo['id'])
     repo_name = repo['name']
@@ -662,6 +600,11 @@ def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt
     report.append(tree_text)
     report.append("")
 
+    report.append("--- MERMAID BRANCH GRAPH ---")
+    mermaid_text = build_mermaid_graph(branches_data, default_branch)
+    report.append(mermaid_text)
+    report.append("")
+
     report.append("--- BRANCH DETAILS ---")
     for b in branches_data:
         p_info = b['parent_info']
@@ -710,7 +653,7 @@ def build_repository_report(repo, branches_data, open_prs_count, run_url, now_dt
     report.append("================================================================================")
     return "\n".join(report)
 
-def process_single_repository(repo, token, drive_service, docs_service, folder_id, config_overrides, state_data, run_url, dry_run=False):
+def process_single_repository(repo, token, drive_service, root_observatory_folder_id, config_overrides, state_data, run_url, dry_run=False):
     repo_id = str(repo['id'])
     repo_name = repo['name']
     full_name = repo['full_name']
@@ -802,63 +745,32 @@ def process_single_repository(repo, token, drive_service, docs_service, folder_i
     )
 
     report_content = build_repository_report(repo, branches_data, len(open_prs), run_url, now_dt_utc)
+    mermaid_content = build_mermaid_graph(branches_data, default_branch)
     report_hash = hashlib.sha256(report_content.encode('utf-8')).hexdigest()
 
-    doc_title = f"{full_name} - Branch Topology Report"
-    doc_info = None
+    if dry_run:
+        log.log(f"[DRY RUN] Would process and upload reports for '{full_name}'")
+        return True, "Updated successfully"
 
-    if drive_service:
-        doc_info = find_document_by_repo_id(drive_service, repo_id)
+    repo_folder_id = get_or_create_folder(drive_service, repo_name, root_observatory_folder_id)
 
-    doc_id = None
-    existing_hash = None
-    is_newly_created = False
+    txt_filename = f"{repo_name}_branch_topology.txt"
+    md_filename = f"{repo_name}_branch_topology.md"
+    mmd_filename = f"{repo_name}_branch_graph.mmd"
 
-    if doc_info:
-        doc_id = doc_info['id']
-        app_props = doc_info.get('appProperties', {}) or {}
-        existing_hash = app_props.get('last_report_hash')
-        existing_title = doc_info.get('name', '')
-        if existing_title != doc_title:
-            log.log(f"Repository renamed detected ({existing_title} -> {doc_title}). Updating title...")
-            update_google_doc_metadata(drive_service, doc_id, new_name=doc_title, dry_run=dry_run)
-    else:
-        log.log(f"No existing Google Doc found for repo ID {repo_id}. Creating new document...")
-        doc_id = create_google_doc_for_repo(drive_service, folder_id, repo_id, doc_title, dry_run=dry_run)
-        is_newly_created = True
-
-    if not is_newly_created:
-        state_last_hash = state_data.get(repo_id, {}).get('last_report_hash')
-        if (existing_hash == report_hash or state_last_hash == report_hash) and not dry_run:
-            log.log(f"Report content unchanged for '{full_name}' (hash: {report_hash[:8]}). Skipping document update.")
-            return True, "No change required"
-
-        existing_doc_obj = None
-        if docs_service and not dry_run:
-            existing_text, existing_doc_obj = get_existing_doc_text_content(docs_service, doc_id)
-            if existing_text:
-                existing_text_hash = hashlib.sha256(existing_text.encode('utf-8')).hexdigest()
-                if existing_text_hash == report_hash:
-                    log.log(f"Existing document body content is identical for '{full_name}'. Skipping update.")
-                    if drive_service and existing_hash != report_hash:
-                        update_google_doc_metadata(drive_service, doc_id, report_hash=report_hash, dry_run=dry_run)
-                    return True, "No change required"
-
-    if docs_service:
-        overwrite_google_doc_content(docs_service, doc_id, report_content, dry_run=dry_run)
-        if drive_service and not dry_run:
-            update_google_doc_metadata(drive_service, doc_id, report_hash=report_hash, dry_run=dry_run)
+    upload_or_update_file(drive_service, repo_folder_id, txt_filename, report_content, repo_id=repo_id, mimetype='text/plain')
+    upload_or_update_file(drive_service, repo_folder_id, md_filename, report_content, repo_id=repo_id, mimetype='text/markdown')
+    upload_or_update_file(drive_service, repo_folder_id, mmd_filename, mermaid_content, repo_id=repo_id, mimetype='text/plain')
 
     state_data[repo_id] = {
         'repo_id': repo_id,
         'full_name': full_name,
-        'doc_id': doc_id,
-        'folder_id': folder_id,
+        'folder_id': repo_folder_id,
         'last_updated_utc': now_dt_utc.isoformat(),
         'last_report_hash': report_hash
     }
 
-    log.log(f"Successfully processed report for '{full_name}' (Doc ID: {doc_id}).")
+    log.log(f"Successfully processed reports for '{full_name}' in Drive folder ID {repo_folder_id}.")
     return True, "Updated successfully"
 
 def main():
@@ -876,16 +788,15 @@ def main():
         log.log("CRITICAL ERROR: Neither SRC_GH_TOKEN nor GITHUB_TOKEN is configured.")
         sys.exit(1)
 
-    drive_service, docs_service = None, None
-    folder_id = None
+    drive_service = None
+    root_observatory_folder_id = None
 
     if GDRIVE_SA_JSON:
         try:
-            drive_service, docs_service = get_google_services(GDRIVE_SA_JSON)
-            folder_id = resolve_or_create_drive_folder(
-                drive_service, GDRIVE_FOLDER_ID, GDRIVE_OBSERVATORY_FOLDER_NAME, dry_run=dry_run_mode
-            )
-            log.log(f"Target Google Drive Folder ID: {folder_id}")
+            drive_service = get_drive_service(GDRIVE_SA_JSON)
+            root_parent = GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else None
+            root_observatory_folder_id = get_or_create_folder(drive_service, GDRIVE_OBSERVATORY_FOLDER_NAME, root_parent)
+            log.log(f"Target Google Drive Root Folder ID: {root_observatory_folder_id}")
         except Exception as e:
             log.log(f"CRITICAL ERROR initializing Google Services: {e}")
             sys.exit(1)
@@ -913,8 +824,8 @@ def main():
     for repo in repos:
         try:
             ok, msg = process_single_repository(
-                repo, SRC_GH_TOKEN, drive_service, docs_service,
-                folder_id, config_overrides, state_data, run_url, dry_run=dry_run_mode
+                repo, SRC_GH_TOKEN, drive_service,
+                root_observatory_folder_id, config_overrides, state_data, run_url, dry_run=dry_run_mode
             )
             if ok:
                 if msg == "No change required":
