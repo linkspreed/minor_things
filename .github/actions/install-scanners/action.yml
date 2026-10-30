@@ -1,0 +1,62 @@
+name: Install security scanners
+description: Installs ClamAV, Trivy and/or Gitleaks silently (checksum-verified binaries).
+inputs:
+  clamav:
+    description: Install ClamAV + clamd and update signatures
+    default: 'false'
+  trivy:
+    description: Install Trivy and download its vulnerability database
+    default: 'false'
+  gitleaks:
+    description: Install Gitleaks
+    default: 'false'
+  github-token:
+    description: Token for GitHub API calls (avoids anonymous rate limits)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install selected scanners
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        WANT_CLAMAV: ${{ inputs.clamav }}
+        WANT_TRIVY: ${{ inputs.trivy }}
+        WANT_GITLEAKS: ${{ inputs.gitleaks }}
+      run: |
+        {
+        set -euo pipefail
+        latest_tag() {
+          curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$1/releases/latest" | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])"
+        }
+        verify() { # $1 asset  $2 checksum file
+          grep " $1\$" "$2" | sha256sum -c - || { echo "checksum mismatch for $1"; exit 1; }
+        }
+        if [ "$WANT_TRIVY" = "true" ]; then
+          TAG=$(latest_tag aquasecurity/trivy); VER="${TAG#v}"
+          ASSET="trivy_${VER}_Linux-64bit.tar.gz"; SUMS="trivy_${VER}_checksums.txt"
+          curl -sSfL -o "$ASSET" "https://github.com/aquasecurity/trivy/releases/download/${TAG}/${ASSET}"
+          curl -sSfL -o "$SUMS" "https://github.com/aquasecurity/trivy/releases/download/${TAG}/${SUMS}"
+          verify "$ASSET" "$SUMS"
+          tar -xzf "$ASSET" trivy && sudo mv trivy /usr/local/bin/trivy && rm -f "$ASSET" "$SUMS"
+          for i in 1 2 3; do trivy image --download-db-only --quiet && break || sleep 20; done
+        fi
+        if [ "$WANT_GITLEAKS" = "true" ]; then
+          TAG=$(latest_tag gitleaks/gitleaks); VER="${TAG#v}"
+          ASSET="gitleaks_${VER}_linux_x64.tar.gz"; SUMS="gitleaks_${VER}_checksums.txt"
+          curl -sSfL -o "$ASSET" "https://github.com/gitleaks/gitleaks/releases/download/${TAG}/${ASSET}"
+          curl -sSfL -o "$SUMS" "https://github.com/gitleaks/gitleaks/releases/download/${TAG}/${SUMS}"
+          verify "$ASSET" "$SUMS"
+          tar -xzf "$ASSET" gitleaks && sudo mv gitleaks /usr/local/bin/gitleaks && rm -f "$ASSET" "$SUMS"
+        fi
+        if [ "$WANT_CLAMAV" = "true" ]; then
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clamav clamav-daemon clamdscan p7zip-full || \
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clamav clamav-daemon p7zip-full
+          sudo systemctl stop clamav-freshclam || true
+          for i in 1 2 3; do sudo freshclam --quiet && break || sleep 45; done
+          sudo systemctl start clamav-daemon || true
+          for i in $(seq 1 90); do [ -S /var/run/clamav/clamd.ctl ] && break; sleep 2; done
+        fi
+        } > /dev/null 2>&1

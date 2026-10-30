@@ -1,0 +1,74 @@
+name: Server-Backup
+run-name: Server-Backup
+on:
+  schedule:
+    - cron: '30 2 * * *'   # daily
+  workflow_dispatch:
+    inputs:
+      include_db:
+        description: "Also create consistent MySQL/MariaDB and PostgreSQL dumps"
+        type: boolean
+        default: true
+      include_docker_layers:
+        description: "Include Docker image/container layers (large, normally rebuildable)"
+        type: boolean
+        default: false
+      retention:
+        description: "Number of backups to keep in Google Drive"
+        type: number
+        default: 7
+permissions: {}
+concurrency:
+  group: server-backup
+  cancel-in-progress: false
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt requests google-api-python-client google-auth > /dev/null 2>&1
+      - name: Run backup (SSH -> encrypt -> Google Drive stream)
+        id: run_backup
+        continue-on-error: true
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          VPS_BACKUP_EXCLUDES: ${{ secrets.VPS_BACKUP_EXCLUDES }}
+          VPS_BACKUP_FOLDER_ID: ${{ secrets.VPS_BACKUP_FOLDER_ID }}
+          BACKUP_ENC_PASSPHRASE: ${{ secrets.BACKUP_ENC_PASSPHRASE }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          VPS_BACKUP_INCLUDE_DB: ${{ github.event_name != 'workflow_dispatch' || inputs.include_db }}
+          VPS_BACKUP_INCLUDE_DOCKER_LAYERS: ${{ github.event_name == 'workflow_dispatch' && inputs.include_docker_layers }}
+          VPS_BACKUP_RETENTION: ${{ inputs.retention || 7 }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: python server_backup.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf bk_reports > /dev/null 2>&1 || true
+      - name: Delete this run from the history
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
+      - name: Mark run as failed if needed
+        if: steps.run_backup.outcome != 'success'
+        run: exit 1

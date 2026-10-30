@@ -1,0 +1,151 @@
+name: Code-Testing-Server
+run-name: Code-Testing-Server
+on:
+  schedule:
+    - cron: '15 3 * * *'   # incremental (only changed repos are re-scanned)
+    - cron: '15 15 * * *'  # incremental
+    - cron: '0 1 * * 0'    # weekly full scan incl. complete git history for secrets
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "incremental = only changed repos | full = every repo + full git history"
+        type: choice
+        options: [incremental, full]
+        default: incremental
+      run_zap:
+        description: "Run the OWASP ZAP baseline scan"
+        type: boolean
+        default: true
+permissions: {}
+concurrency:
+  group: code-testing-server
+  cancel-in-progress: false
+env:
+  CQ_RUN_KEY: run-${{ github.run_id }}-${{ github.run_attempt }}
+  CQ_SCAN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || (github.event.schedule == '0 1 * * 0' && 'full' || 'incremental') }}
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install linters
+        run: |
+          {
+            pip install --quiet -r requirements.txt requests google-api-python-client google-auth ruff bandit yamllint
+            npm install -g --silent @biomejs/biome@2
+            docker pull -q hadolint/hadolint
+            command -v shellcheck || sudo apt-get install -y -qq shellcheck
+          } > /dev/null 2>&1 || true
+      - name: Install scanners
+        uses: ./.github/actions/install-scanners
+        with:
+          trivy: 'true'
+          gitleaks: 'true'
+          github-token: ${{ secrets.SRC_GH_TOKEN }}
+      - name: Scan repositories of this shard
+        continue-on-error: true
+        env:
+          CQ_MODE: shard
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+          SRC_GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+          SRC_GH_OWNER: ${{ secrets.SRC_GH_OWNER || vars.SRC_GH_OWNER }}
+          SRC_GH_OWNER_TYPE: ${{ secrets.SRC_GH_OWNER_TYPE || vars.SRC_GH_OWNER_TYPE }}
+          SCAN_REPO_LIST: ${{ secrets.SCAN_REPO_LIST }}
+          SCAN_REPO_EXCLUDE: ${{ secrets.SCAN_REPO_EXCLUDE }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          FORCE_RESCAN_DAYS: "7"
+          SHARD_BUDGET_MIN: "300"
+        run: python code_quality_scan.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf cq_work cq_reports > /dev/null 2>&1 || true
+
+  zap:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_zap
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          {
+            pip install --quiet -r requirements.txt requests google-api-python-client google-auth
+            docker pull -q ghcr.io/zaproxy/zaproxy:stable
+          } > /dev/null 2>&1
+      - name: OWASP ZAP baseline scan
+        continue-on-error: true
+        env:
+          CQ_MODE: zap
+          ZAP_TARGETS: ${{ secrets.ZAP_TARGETS }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          ZAP_MAX_MINUTES: "5"
+        run: python code_quality_scan.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf cq_work > /dev/null 2>&1 || true
+
+  aggregate:
+    needs: [shard, zap]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt requests google-api-python-client google-auth > /dev/null 2>&1
+      - name: Merge results and send report
+        id: aggregate
+        continue-on-error: true
+        env:
+          CQ_MODE: aggregate
+          EXPECTED_SHARDS: "6"
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID || vars.GDRIVE_FOLDER_ID }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: python code_quality_scan.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf cq_work cq_reports > /dev/null 2>&1 || true
+      - name: Delete this run from the history
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
+      - name: Mark run as failed if needed
+        if: steps.aggregate.outcome != 'success'
+        run: exit 1

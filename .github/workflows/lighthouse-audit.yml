@@ -1,0 +1,65 @@
+name: Lighthouse-Audit
+run-name: Lighthouse-Audit
+on:
+  schedule:
+    - cron: '30 5 * * 1'   # every Monday
+  workflow_dispatch:
+    inputs:
+      form_factors:
+        description: "Devices to emulate"
+        type: choice
+        options: ['mobile,desktop', 'mobile', 'desktop']
+        default: 'mobile,desktop'
+      runs:
+        description: "Runs per URL (median is reported, 1-5)"
+        type: number
+        default: 1
+permissions: {}
+concurrency:
+  group: lighthouse-audit
+  cancel-in-progress: false
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          {
+            pip install --quiet -r requirements.txt requests
+            npm install -g --silent lighthouse@12
+          } > /dev/null 2>&1
+      - name: Run Lighthouse audits
+        id: run_lh
+        continue-on-error: true
+        env:
+          LIGHTHOUSE_URLS: ${{ secrets.LIGHTHOUSE_URLS }}
+          LH_FORM_FACTORS: ${{ inputs.form_factors || 'mobile,desktop' }}
+          LH_RUNS: ${{ inputs.runs || 1 }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: python lighthouse_audit.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf lh_work lh_reports > /dev/null 2>&1 || true
+      - name: Delete this run from the history
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
+      - name: Mark run as failed if needed
+        if: steps.run_lh.outcome != 'success'
+        run: exit 1

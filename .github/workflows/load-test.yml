@@ -1,0 +1,118 @@
+name: Load-Test
+run-name: Load-Test
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target alias from the LOADTEST_TARGETS secret (e.g. t1)"
+        type: string
+        default: t1
+      profile:
+        description: "smoke = 5 users/1 min | load = ramp-hold-down | stress = 4 rising steps | spike = sudden burst | soak = long hold | breakpoint = rising arrival rate"
+        type: choice
+        options: [smoke, load, stress, spike, soak, breakpoint]
+        default: load
+      vus:
+        description: "Peak virtual users"
+        type: number
+        default: 200
+      duration:
+        description: "Steady-state duration (e.g. 5m, 30m, 1h)"
+        type: string
+        default: 5m
+      ramp_up:
+        description: "Ramp-up time (e.g. 1m)"
+        type: string
+        default: 1m
+      rps:
+        description: "Target requests/second (0 = as fast as the users can go)"
+        type: number
+        default: 0
+      p95_ms:
+        description: "Pass threshold: p95 response time in ms"
+        type: number
+        default: 1500
+      max_error_rate:
+        description: "Pass threshold: max error rate (0.01 = 1 %)"
+        type: string
+        default: '0.01'
+      think_ms:
+        description: "Think time between requests per user in ms"
+        type: number
+        default: 500
+permissions: {}
+concurrency:
+  group: load-test
+  cancel-in-progress: false
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbe7f9c59b41e40162b753c062f5d49a3
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt requests > /dev/null 2>&1
+      - name: Install k6 (signed apt repo, checksum-verified fallback)
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          {
+            set -e
+            if ! ( sudo gpg -k \
+              && sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69 \
+              && echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list \
+              && sudo apt-get update -qq && sudo apt-get install -y -qq k6 ); then
+              TAG=$(curl -sSfL -H "Authorization: Bearer ${GH_TOKEN}" https://api.github.com/repos/grafana/k6/releases/latest | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+              ASSET="k6-${TAG}-linux-amd64.tar.gz"; SUMS="k6-${TAG}-checksums.txt"
+              curl -sSfL -o "$ASSET" "https://github.com/grafana/k6/releases/download/${TAG}/${ASSET}"
+              curl -sSfL -o "$SUMS" "https://github.com/grafana/k6/releases/download/${TAG}/${SUMS}"
+              grep " ${ASSET}\$" "$SUMS" | sha256sum -c -
+              tar -xzf "$ASSET" && sudo mv "k6-${TAG}-linux-amd64/k6" /usr/local/bin/k6 && rm -rf k6-*
+            fi
+          } > /dev/null 2>&1
+      - name: Tune network limits
+        run: |
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1 > /dev/null 2>&1 || true
+      - name: Run load test
+        id: run_lt
+        continue-on-error: true
+        env:
+          LT_TARGET: ${{ inputs.target }}
+          LT_PROFILE: ${{ inputs.profile }}
+          LT_VUS: ${{ inputs.vus }}
+          LT_DURATION: ${{ inputs.duration }}
+          LT_RAMP_UP: ${{ inputs.ramp_up }}
+          LT_RPS: ${{ inputs.rps }}
+          LT_P95_MS: ${{ inputs.p95_ms }}
+          LT_MAX_ERROR_RATE: ${{ inputs.max_error_rate }}
+          LT_THINK_MS: ${{ inputs.think_ms }}
+          LOADTEST_TARGETS: ${{ secrets.LOADTEST_TARGETS }}
+          LOADTEST_BYPASS_HEADER: ${{ secrets.LOADTEST_BYPASS_HEADER }}
+          REPORT_TO: ${{ secrets.REPORT_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: |
+          ulimit -n 250000 || ulimit -n 65535 || true
+          python load_test.py > /dev/null 2>&1
+      - name: Remove working data
+        if: always()
+        run: rm -rf lt_work lt_reports > /dev/null 2>&1 || true
+      - name: Delete this run from the history
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SRC_GH_TOKEN }}
+        run: |
+          curl -sSfL -X DELETE -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null 2>&1 || true
+      - name: Mark run as failed if needed
+        if: steps.run_lt.outcome != 'success'
+        run: exit 1
